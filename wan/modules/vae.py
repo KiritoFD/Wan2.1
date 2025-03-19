@@ -14,7 +14,7 @@ __all__ = [
 CACHE_T = 2
 
 
-class CausalConv3d(nn.Conv3d):
+class CausalConv3d(nn.Conv3d):#这个类没有其他依赖，数据预处理
     """
     Causal 3d convolusion.
     """
@@ -23,17 +23,27 @@ class CausalConv3d(nn.Conv3d):
         super().__init__(*args, **kwargs)
         self._padding = (self.padding[2], self.padding[2], self.padding[1],
                          self.padding[1], 2 * self.padding[0], 0)
+        #【2】：左右填充相同宽度；【1】：上下填充相同高度；【0】：前填充2倍，后不填（保持大小，不看到后面的信息）
         self.padding = (0, 0, 0)
+        #padding的分量：(width_left, width_right, height_top, height_bottom, depth_past, depth_future(0))
 
-    def forward(self, x, cache_x=None):
-        padding = list(self._padding)
-        if cache_x is not None and self._padding[4] > 0:
-            cache_x = cache_x.to(x.device)
-            x = torch.cat([cache_x, x], dim=2)
-            padding[4] -= cache_x.shape[2]
-        x = F.pad(x, padding)
-
-        return super().forward(x)
+    def forward(self, x, cache_x=None):#x是输入，cache_x是上一个block的输出
+        padding = list(self._padding)#按照上面的方法进行填充
+        if cache_x is not None and self._padding[4] > 0:#是否已经缓存；是否需要在时间维度上填充
+            cache_x = cache_x.to(x.device)#移动到当前设备
+            x = torch.cat([cache_x, x], dim=2)#在时间维度（dim=2)上拼接
+            #torch.cat:拼接两个tensor，dim=2表示在时间维度上拼接；cache_x是上一个block的输出，x是当前block的输入
+            #cache_x.shape[2]表示上一个block的输出的时间维度大小；x.shape[2]表示当前block的输入的时间维度大小
+            #为什么要拼接：将之前的帧加入输入中，实现因果卷积
+            padding[4] -= cache_x.shape[2]#由于拼接了cache_x，所以需要减少填充的数量，避免重复填充
+        #填充前x分量：（batch_size, in_channels, depth, height, width）
+        x = F.pad(x, padding)#在时间维度上填充
+        #填充后x:(batch_size, in_channels, depth+padding[4](时间过去）+padding[5](时间填充),
+        #  height+padding[2]（高度顶部填充）+padding[3](高度底部填充), width+padding[0]（宽度左侧填充）+padding[1]（宽度右侧填充)
+        #F.pad:对输入进行填充，padding是填充的大小；x是当前block的输入
+        return super().forward(x)#调用父类的forward方法进行卷积操作；super()是父类
+        #继承自nn.Conv3d的forward方法，进行卷积操作；x是当前block的输入；用的卷积核是self.weight，偏置是self.bias
+        #nn.Conv3d:三维卷积，输入是一个五维tensor，输出是一个五维tensor；输入的shape是(batch_size, in_channels, depth, height, width)，输出的shape是(batch_size, out_channels, depth_out, height_out, width_out)
 
 
 class RMS_norm(nn.Module):
