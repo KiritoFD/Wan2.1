@@ -243,143 +243,152 @@ class AttentionBlock(nn.Module):
 
     def __init__(self, dim):
         super().__init__()
-        self.dim = dim
+        self.dim = dim  # 输入特征的通道数
 
         # layers
-        self.norm = RMS_norm(dim)
-        self.to_qkv = nn.Conv2d(dim, dim * 3, 1)
-        self.proj = nn.Conv2d(dim, dim, 1)
+        self.norm = RMS_norm(dim)  # 归一化层，使用RMS_norm
+        self.to_qkv = nn.Conv2d(dim, dim * 3, 1)  # 1x1卷积，用于生成query、key、value
+        self.proj = nn.Conv2d(dim, dim, 1)  # 1x1卷积，用于投影输出
 
         # zero out the last layer params
-        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.weight)  # 初始化投影层的权重为0
 
     def forward(self, x):
-        identity = x
-        b, c, t, h, w = x.size()
-        x = rearrange(x, 'b c t h w -> (b t) c h w')
-        x = self.norm(x)
+        identity = x  # 保存输入，用于残差连接
+        b, c, t, h, w = x.size()  # 获取输入的维度信息
+        x = rearrange(x, 'b c t h w -> (b t) c h w')  # 将时间维度合并到批次维度
+        x = self.norm(x)  # 对输入进行归一化
+
         # compute query, key, value
-        q, k, v = self.to_qkv(x).reshape(b * t, 1, c * 3,
-                                         -1).permute(0, 1, 3,
-                                                     2).contiguous().chunk(
-                                                         3, dim=-1)
+        q, k, v = self.to_qkv(x).reshape(b * t, 1, c * 3, -1).permute(0, 1, 3, 2).contiguous().chunk(3, dim=-1)
+        # 使用1x1卷积生成query、key、value，并将通道维度分为3部分
 
         # apply attention
-        x = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-        )
-        x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
+        x = F.scaled_dot_product_attention(q, k, v)  # 使用scaled dot-product attention计算注意力
+        x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)  # 调整维度，恢复到卷积后的形状
 
         # output
-        x = self.proj(x)
-        x = rearrange(x, '(b t) c h w-> b c t h w', t=t)
-        return x + identity
+        x = self.proj(x)  # 投影输出
+        x = rearrange(x, '(b t) c h w-> b c t h w', t=t)  # 恢复原始的时间维度
+        return x + identity  # 残差连接，将输入与注意力输出相加
 
 
 class Encoder3d(nn.Module):
-
+    """
+    3D encoder for video variational autoencoder that processes video input to latent representation.
+    Uses a series of residual blocks, attention blocks, and downsampling operations to encode video.
+    """
     def __init__(self,
-                 dim=128,
-                 z_dim=4,
-                 dim_mult=[1, 2, 4, 4],
-                 num_res_blocks=2,
-                 attn_scales=[],
-                 temperal_downsample=[True, True, False],
-                 dropout=0.0):
+                 dim=128,                          # 基础特征维度
+                 z_dim=4,                          # 潜在空间维度
+                 dim_mult=[1, 2, 4, 4],            # 各级特征通道数的倍数
+                 num_res_blocks=2,                 # 每个尺度上的残差块数量
+                 attn_scales=[],                   # 应用注意力机制的尺度
+                 temperal_downsample=[True, True, False],  # 是否在时间维度上进行下采样
+                 dropout=0.0):                     # dropout概率，用于防止过拟合
         super().__init__()
-        self.dim = dim
-        self.z_dim = z_dim
-        self.dim_mult = dim_mult
-        self.num_res_blocks = num_res_blocks
-        self.attn_scales = attn_scales
-        self.temperal_downsample = temperal_downsample
+        self.dim = dim                            # 保存基础特征维度
+        self.z_dim = z_dim                        # 保存潜在空间维度
+        self.dim_mult = dim_mult                  # 保存通道倍数列表
+        self.num_res_blocks = num_res_blocks      # 保存每级残差块数量
+        self.attn_scales = attn_scales            # 保存注意力尺度列表
+        self.temperal_downsample = temperal_downsample  # 保存时间下采样配置
 
-        # dimensions
-        dims = [dim * u for u in [1] + dim_mult]
-        scale = 1.0
+        # 计算各级特征的通道数维度
+        dims = [dim * u for u in [1] + dim_mult]  # 计算每个层级的通道数
+        scale = 1.0                              # 特征图缩放因子，用于跟踪分辨率变化
 
-        # init block
-        self.conv1 = CausalConv3d(3, dims[0], 3, padding=1)
+        # 初始化输入卷积层
+        self.conv1 = CausalConv3d(3, dims[0], 3, padding=1)  # 输入为RGB(3通道)，输出为dims[0]通道，3x3x3卷积核
 
-        # downsample blocks
+        # 下采样块构建
         downsamples = []
-        for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
-            # residual (+attention) blocks
-            for _ in range(num_res_blocks):
-                downsamples.append(ResidualBlock(in_dim, out_dim, dropout))
-                if scale in attn_scales:
-                    downsamples.append(AttentionBlock(out_dim))
-                in_dim = out_dim
+        for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):  # 遍历各级特征维度
+            # 添加残差块和可选的注意力块
+            for _ in range(num_res_blocks):  # 根据配置添加残差块
+                downsamples.append(ResidualBlock(in_dim, out_dim, dropout))  # 添加残差块
+                if scale in attn_scales:  # 如果当前尺度需要注意力
+                    downsamples.append(AttentionBlock(out_dim))  # 添加注意力块
+                in_dim = out_dim  # 更新输入维度为当前输出维度
 
-            # downsample block
-            if i != len(dim_mult) - 1:
-                mode = 'downsample3d' if temperal_downsample[
-                    i] else 'downsample2d'
-                downsamples.append(Resample(out_dim, mode=mode))
-                scale /= 2.0
-        self.downsamples = nn.Sequential(*downsamples)
+            # 添加下采样块（如果不是最后一级）
+            if i != len(dim_mult) - 1:  # 判断是否为最后一级特征提取
+                # 选择下采样模式：3D或2D
+                mode = 'downsample3d' if temperal_downsample[i] else 'downsample2d'  # 根据配置决定是否在时间维度下采样
+                downsamples.append(Resample(out_dim, mode=mode))  # 添加下采样层
+                scale /= 2.0  # 更新缩放因子，表示分辨率降低一半
+        self.downsamples = nn.Sequential(*downsamples)  # 将下采样模块打包为Sequential
 
-        # middle blocks
+        # 中间处理块
         self.middle = nn.Sequential(
-            ResidualBlock(out_dim, out_dim, dropout), AttentionBlock(out_dim),
-            ResidualBlock(out_dim, out_dim, dropout))
+            ResidualBlock(out_dim, out_dim, dropout),  # 第一个残差块
+            AttentionBlock(out_dim),                  # 注意力块增强特征表示
+            ResidualBlock(out_dim, out_dim, dropout)   # 第二个残差块
+        )
 
-        # output blocks
+        # 输出处理层
         self.head = nn.Sequential(
-            RMS_norm(out_dim, images=False), nn.SiLU(),
-            CausalConv3d(out_dim, z_dim, 3, padding=1))
+            RMS_norm(out_dim, images=False),  # RMS归一化层，用于特征归一化
+            nn.SiLU(),                        # SiLU激活函数（Sigmoid Linear Unit）
+            CausalConv3d(out_dim, z_dim, 3, padding=1)  # 输出卷积层，将特征映射到潜在空间
+        )
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
-        if feat_cache is not None:
-            idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                # cache last frame of last two chunk
+        """
+        前向传播函数
+        x: 输入视频张量 [batch_size, channels, time, height, width]
+        feat_cache: 特征缓存，用于因果推理
+        feat_idx: 当前特征缓存的索引
+        """
+        # 处理初始卷积层，带缓存支持
+        if feat_cache is not None:  # 如果启用了特征缓存
+            idx = feat_idx[0]  # 获取当前缓存索引
+            cache_x = x[:, :, -CACHE_T:, :, :].clone()  # 克隆最后CACHE_T帧作为新缓存
+            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:  # 如果缓存帧数不足且有之前的缓存
+                # 将之前缓存的最后一帧与当前帧拼接
                 cache_x = torch.cat([
                     feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
-                        cache_x.device), cache_x
+                        cache_x.device), cache_x  # 拼接上一帧特征
                 ],
-                                    dim=2)
-            x = self.conv1(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
-            feat_idx[0] += 1
+                                    dim=2)  # 在时间维度拼接
+            x = self.conv1(x, feat_cache[idx])  # 使用缓存进行卷积
+            feat_cache[idx] = cache_x  # 更新缓存
+            feat_idx[0] += 1  # 更新索引
         else:
-            x = self.conv1(x)
+            x = self.conv1(x)  # 不使用缓存的标准卷积
 
-        ## downsamples
-        for layer in self.downsamples:
-            if feat_cache is not None:
-                x = layer(x, feat_cache, feat_idx)
+        ## 下采样处理阶段
+        for layer in self.downsamples:  # 遍历所有下采样层
+            if feat_cache is not None:  # 如果启用缓存
+                x = layer(x, feat_cache, feat_idx)  # 使用缓存处理
             else:
-                x = layer(x)
+                x = layer(x)  # 标准处理（无缓存）
 
-        ## middle
-        for layer in self.middle:
-            if isinstance(layer, ResidualBlock) and feat_cache is not None:
-                x = layer(x, feat_cache, feat_idx)
+        ## 中间处理阶段
+        for layer in self.middle:  # 遍历中间处理层
+            if isinstance(layer, ResidualBlock) and feat_cache is not None:  # 如果是残差块且启用缓存
+                x = layer(x, feat_cache, feat_idx)  # 带缓存处理
             else:
-                x = layer(x)
+                x = layer(x)  # 标准处理
 
-        ## head
-        for layer in self.head:
-            if isinstance(layer, CausalConv3d) and feat_cache is not None:
-                idx = feat_idx[0]
-                cache_x = x[:, :, -CACHE_T:, :, :].clone()
-                if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                    # cache last frame of last two chunk
+        ## 输出头部处理
+        for layer in self.head:  # 遍历输出层
+            if isinstance(layer, CausalConv3d) and feat_cache is not None:  # 如果是因果卷积且启用缓存
+                idx = feat_idx[0]  # 获取当前索引
+                cache_x = x[:, :, -CACHE_T:, :, :].clone()  # 克隆尾部帧作为缓存
+                if cache_x.shape[2] < 2 and feat_cache[idx] is not None:  # 如果缓存帧数不足且有之前缓存
+                    # 拼接之前缓存的最后一帧
                     cache_x = torch.cat([
                         feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
-                            cache_x.device), cache_x
+                            cache_x.device), cache_x  # 添加时间维度并拼接
                     ],
-                                        dim=2)
-                x = layer(x, feat_cache[idx])
-                feat_cache[idx] = cache_x
-                feat_idx[0] += 1
+                                        dim=2)  # 在时间维度上拼接
+                x = layer(x, feat_cache[idx])  # 使用缓存进行处理
+                feat_cache[idx] = cache_x  # 更新缓存
+                feat_idx[0] += 1  # 更新索引
             else:
-                x = layer(x)
-        return x
+                x = layer(x)  # 标准处理
+        return x  # 返回编码后的特征
 
 
 class Decoder3d(nn.Module):
