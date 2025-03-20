@@ -167,25 +167,25 @@ class Resample(nn.Module):#特征图的重采样
                     #     cache_x = torch.cat([feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2)
 
                     x = self.time_conv(#
-                        torch.cat([feat_cache[idx][:, :, -1:, :, :], x], 2))
-                    feat_cache[idx] = cache_x
-                    feat_idx[0] += 1
+                        torch.cat([feat_cache[idx][:, :, -1:, :, :], x], 2))#提取最后一帧的特征图，拼接到当前块的输出上
+                    feat_cache[idx] = cache_x#缓存当前块的输出
+                    feat_idx[0] += 1#移到下一个block
         return x
 
-    def init_weight(self, conv):
+    def init_weight(self, conv):#初始化卷积层的权重
         conv_weight = conv.weight
-        nn.init.zeros_(conv_weight)
-        c1, c2, t, h, w = conv_weight.size()
-        one_matrix = torch.eye(c1, c2)
+        nn.init.zeros_(conv_weight)#初始化为0
+        c1, c2, t, h, w = conv_weight.size()#获取卷积核的大小
+        one_matrix = torch.eye(c1, c2)#单位矩阵，大小为(c1, c2)；torch.eye:创建一个单位矩阵，主对角线为1，其余元素为0；
         init_matrix = one_matrix
-        nn.init.zeros_(conv_weight)
+        nn.init.zeros_(conv_weight)#初始化为0
         #conv_weight.data[:,:,-1,1,1] = init_matrix * 0.5
-        conv_weight.data[:, :, 1, 0, 0] = init_matrix  #* 0.5
-        conv.weight.data.copy_(conv_weight)
-        nn.init.zeros_(conv.bias.data)
+        conv_weight.data[:, :, 1, 0, 0] = init_matrix  #* 0.5;
+        conv.weight.data.copy_(conv_weight)#将初始化的卷积核复制到conv_weight中
+        nn.init.zeros_(conv.bias.data)#初始化偏置为0
 
-    def init_weight2(self, conv):
-        conv_weight = conv.weight.data
+    def init_weight2(self, conv):#与上面的区别：将单位矩阵设置在时间维度的最后一帧上，输出通道分为两部分，分别对应于输入通道的前后两部分；
+        conv_weight = conv.weight.data#
         nn.init.zeros_(conv_weight)
         c1, c2, t, h, w = conv_weight.size()
         init_matrix = torch.eye(c1 // 2, c2)
@@ -196,41 +196,44 @@ class Resample(nn.Module):#特征图的重采样
         nn.init.zeros_(conv.bias.data)
 
 
-class ResidualBlock(nn.Module):
-
+class ResidualBlock(nn.Module):#残差块，将输入特征图直接添加到经过一系列层处理后的输出特征图上；
+#残差的作用：通过跳过连接（skip connection）来缓解深度网络中的梯度消失和爆炸问题；
     def __init__(self, in_dim, out_dim, dropout=0.0):
         super().__init__()
-        self.in_dim = in_dim
-        self.out_dim = out_dim
+        self.in_dim = in_dim#输入通道数
+        self.out_dim = out_dim#输出通道数
 
         # layers
-        self.residual = nn.Sequential(
-            RMS_norm(in_dim, images=False), nn.SiLU(),
-            CausalConv3d(in_dim, out_dim, 3, padding=1),
-            RMS_norm(out_dim, images=False), nn.SiLU(), nn.Dropout(dropout),
-            CausalConv3d(out_dim, out_dim, 3, padding=1))
+        self.residual = nn.Sequential(#定义残差函数
+            RMS_norm(in_dim, images=False), nn.SiLU(),#（上面的）RMS归一化+ SiLU激活函数
+            CausalConv3d(in_dim, out_dim, 3, padding=1),#卷积层，卷积核大小为3，padding=1保持大小不变
+            RMS_norm(out_dim, images=False), nn.SiLU(), nn.Dropout(dropout),#归一化+激活函数+dropout（防止过拟合）
+            CausalConv3d(out_dim, out_dim, 3, padding=1))#卷积层，卷积核大小为3，padding=1保持大小不变
         self.shortcut = CausalConv3d(in_dim, out_dim, 1) \
-            if in_dim != out_dim else nn.Identity()
+            if in_dim != out_dim else nn.Identity()#残差连接；如果输入通道数和输出通道数不相等，则使用1x1卷积进行匹配；否则使用恒等映射（nn.Identity()）
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
-        h = self.shortcut(x)
-        for layer in self.residual:
-            if isinstance(layer, CausalConv3d) and feat_cache is not None:
-                idx = feat_idx[0]
-                cache_x = x[:, :, -CACHE_T:, :, :].clone()
-                if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
+    def forward(self, x, feat_cache=None, feat_idx=[0]):#残差块的前向传播
+        h = self.shortcut(x)#shortcut连接；x是当前块的输入
+        for layer in self.residual:#残差块的每一层
+            if isinstance(layer, CausalConv3d) and feat_cache is not None:#是CausalConv3d层，且开启了特征缓存
+                idx = feat_idx[0]#获取当前块的索引
+                cache_x = x[:, :, -CACHE_T:, :, :].clone()##提取最后CACHE_T帧的特征图，复制到cache_x中（创建副本）
+                if cache_x.shape[2] < 2 and feat_cache[idx] is not None:#检查时间维度<2（头尾发生）即是否要缓存，且缓存不为空
                     # cache last frame of last two chunk
                     cache_x = torch.cat([
-                        feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
-                            cache_x.device), cache_x
+                        feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(#提取最后一帧，增加一个时间维度，cache_x.shape[2] = 1；unsqueeze(2)表示在时间维度上增加一个维度
+                            cache_x.device), cache_x#移动到当前设备
                     ],
-                                        dim=2)
-                x = layer(x, feat_cache[idx])
-                feat_cache[idx] = cache_x
-                feat_idx[0] += 1
+                                        dim=2)#把cache_x和feat_cache[idx]拼接在一起，dim=2表示在时间维度上拼接
+                x = layer(x, feat_cache[idx])##使用缓存的特征图进行卷积操作；layer是CausalConv3d层
+                feat_cache[idx] = cache_x#缓存当前块的输出
+                feat_idx[0] += 1#移到下一个block
             else:
-                x = layer(x)
-        return x + h
+                x = layer(x)#进行卷积操作；layer是RMS_norm、SiLU、Dropout等层
+        return x + h#残差连接；将输入x和经过一系列层处理后的输出x相加；
+#与其让网络学习一个复杂的映射 H(x)，不如让网络学习残差 F(x) = H(x) - x，然后将残差加到输入 x 上，得到最终的输出 H(x) = F(x) + x。
+#h是x与预期输出之间的差异，x是输入；通过残差连接，网络可以更容易地学习到输入和输出之间的关系；
+#h更小容易学习；直接梯度传播防止消失；容易学到恒等映射
 
 
 class AttentionBlock(nn.Module):
