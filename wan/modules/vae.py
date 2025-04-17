@@ -123,14 +123,14 @@ class Resample(nn.Module):#特征图的重采样
                     feat_idx[0] += 1#移到下一个block
                 else:
                     cache_x = x[:, :, -CACHE_T:, :, :].clone()#提取最后CACHE_T帧的特征图，复制到cache_x中（创建副本）
-                    if cache_x.shape[2] < 2 and feat_cache[#检查时间维度<2（头尾发生），且缓存不为空
+                    if cache_x.shape[2] < 2 and feat_cache[#
                             idx] is not None and feat_cache[idx] != 'Rep':#非Rep标记，即已经缓存了有效特征图，不是初始                       
                         cache_x = torch.cat([#从之前的块中缓存最后一帧特征图
                             feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(#增加一个时间维度，cache_x.shape[2] = 1
                                 cache_x.device), cache_x#将最后一帧特征图拼接到cache_x中
                         ],
                                             dim=2)#在时间维度上拼接
-                    if cache_x.shape[2] < 2 and feat_cache[#初始状态
+                    if cache_x.shape[2] < 2 and feat_cache[#
                             idx] is not None and feat_cache[idx] == 'Rep':
                         cache_x = torch.cat([
                             torch.zeros_like(cache_x).to(cache_x.device),#零填充
@@ -254,12 +254,13 @@ class AttentionBlock(nn.Module):
         nn.init.zeros_(self.proj.weight)
 
     def forward(self, x):
-        identity = x
-        b, c, t, h, w = x.size()
-        x = rearrange(x, 'b c t h w -> (b t) c h w')
-        x = self.norm(x)
+        identity = x #保留输入副本，用于残差链接
+        b, c, t, h, w = x.size()#获取输入形状
+        x = rearrange(x, 'b c t h w -> (b t) c h w')#批次和时间合并，每个事件步作为单独样本处理
+        #不跨时间，保持因果性，看不到未来帧
+        x = self.norm(x)#归一化提高训练稳定性
         # compute query, key, value
-        q, k, v = self.to_qkv(x).reshape(b * t, 1, c * 3,
+        q, k, v = self.to_qkv(x).reshape(b * t, 1, c * 3,#单头注意力
                                          -1).permute(0, 1, 3,
                                                      2).contiguous().chunk(
                                                          3, dim=-1)
@@ -283,11 +284,11 @@ class Encoder3d(nn.Module):
     def __init__(self,
                  dim=128,
                  z_dim=4,
-                 dim_mult=[1, 2, 4, 4],
-                 num_res_blocks=2,
-                 attn_scales=[],
-                 temperal_downsample=[True, True, False],
-                 dropout=0.0):
+                 dim_mult=[1, 2, 4, 4],#渐进式通道增长模式，减小特征图空间尺寸同时增加通道数
+                 num_res_blocks=2,#可配置的残差块数量，便于调整网络深度
+                 attn_scales=[],#可选择性地在特定尺度添加注意力，减少计算量
+                 temperal_downsample=[True, True, False],#灵活配置时间维度下采样策略
+                 dropout=0.0):# 改进点：可考虑在训练时使用更强的正则化策略如stochastic depth
         super().__init__()
         self.dim = dim
         self.z_dim = z_dim
@@ -301,35 +302,35 @@ class Encoder3d(nn.Module):
         scale = 1.0
 
         # init block
-        self.conv1 = CausalConv3d(3, dims[0], 3, padding=1)
+        self.conv1 = CausalConv3d(3, dims[0], 3, padding=1)# 亮点：使用因果卷积，保持时序因果性
 
-        # downsample blocks
+        # downsample blocks，多级下采样压缩
         downsamples = []
         for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
             # residual (+attention) blocks
             for _ in range(num_res_blocks):
-                downsamples.append(ResidualBlock(in_dim, out_dim, dropout))
+                downsamples.append(ResidualBlock(in_dim, out_dim, dropout)#残差连接设计
                 if scale in attn_scales:
-                    downsamples.append(AttentionBlock(out_dim))
+                    downsamples.append(AttentionBlock(out_dim))# 亮点：选择性注意力机制，平衡计算效率和表达能力
                 in_dim = out_dim
 
             # downsample block
             if i != len(dim_mult) - 1:
                 mode = 'downsample3d' if temperal_downsample[
-                    i] else 'downsample2d'
+                    i] else 'downsample2d'# 亮点：灵活的下采样策略，可单独控制时间维度
                 downsamples.append(Resample(out_dim, mode=mode))
                 scale /= 2.0
         self.downsamples = nn.Sequential(*downsamples)
 
-        # middle blocks
-        self.middle = nn.Sequential(
-            ResidualBlock(out_dim, out_dim, dropout), AttentionBlock(out_dim),
-            ResidualBlock(out_dim, out_dim, dropout))
-
+        # middle blocks，用于最低分辨率处保护注意力捕获的信息
+        self.middle = nn.Sequential(#三明治结构：节省注意力计算量，残差确保梯度避免爆炸/消失
+            ResidualBlock(out_dim, out_dim, dropout),#第一个残差块，预处理特征，为注意力机制准备更好的特征分布
+            AttentionBlock(out_dim),# 瓶颈处使用注意力机制捕获全局依赖关系，允许信息在整个特征图流动
+            ResidualBlock(out_dim, out_dim, dropout)) # 提炼特征，融合局部和全局信息，残差保证梯度流动和特征保留
         # output blocks
         self.head = nn.Sequential(
             RMS_norm(out_dim, images=False), nn.SiLU(),
-            CausalConv3d(out_dim, z_dim, 3, padding=1))
+            CausalConv3d(out_dim, z_dim, 3, padding=1))#映射，维持时序因果
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         if feat_cache is not None:
@@ -497,6 +498,20 @@ def count_conv3d(model):
 
 
 class WanVAE_(nn.Module):
+    """
+    WanVAE核心模型类，实现了视频VAE的编码器和解码器功能。
+    
+    亮点：
+    1. 采用3D卷积网络处理视频数据，保持时空连续性
+    2. 使用因果卷积确保实时推理能力，避免时序泄露
+    3. 高效的时序分块处理机制，支持任意长度视频处理
+    4. 缓存机制减少冗余计算，提高推理速度
+    
+    改进点：
+    1. 可考虑添加条件控制机制，增强对视频内容的控制能力
+    2. 引入更强的时序一致性约束，提高生成视频的连贯性
+    3. 优化内存使用，降低长视频处理的显存占用
+    """
 
     def __init__(self,
                  dim=128,
@@ -506,6 +521,18 @@ class WanVAE_(nn.Module):
                  attn_scales=[],
                  temperal_downsample=[True, True, False],
                  dropout=0.0):
+        """
+        初始化视频VAE模型。
+        
+        参数:
+            dim: 基础特征维度
+            z_dim: 潜在空间维度
+            dim_mult: 不同层级的通道倍增系数
+            num_res_blocks: 每个尺度的残差块数量
+            attn_scales: 应用注意力机制的尺度
+            temperal_downsample: 时间维度下采样策略
+            dropout: Dropout比率，用于正则化
+        """
         super().__init__()
         self.dim = dim
         self.z_dim = z_dim
@@ -524,12 +551,37 @@ class WanVAE_(nn.Module):
                                  attn_scales, self.temperal_upsample, dropout)
 
     def forward(self, x):
+        """
+        模型前向传播，完成编码-采样-解码过程。
+        
+        亮点：完整的VAE流程，包含重参数化采样环节
+        参数:
+            x: 输入视频张量 [B,C,T,H,W]
+        返回:
+            x_recon: 重建视频
+            mu: 均值
+            log_var: 对数方差
+        """
         mu, log_var = self.encode(x)
         z = self.reparameterize(mu, log_var)
         x_recon = self.decode(z)
         return x_recon, mu, log_var
 
     def encode(self, x, scale):
+        """
+        视频编码器，将视频映射到潜在空间。
+        
+        亮点：
+        1. 高效分块处理机制，支持任意长度视频
+        2. 时间维度上首帧单独处理，后续帧分组处理(1,4,4,4...)，优化时序建模
+        3. 特征缓存机制避免重复计算
+        
+        参数:
+            x: 输入视频 [B,C,T,H,W]
+            scale: 潜在空间归一化参数 [mean, std]
+        返回:
+            mu: 归一化后的潜在表示
+        """
         self.clear_cache()
         ## cache
         t = x.shape[2]
@@ -538,17 +590,21 @@ class WanVAE_(nn.Module):
         for i in range(iter_):
             self._enc_conv_idx = [0]
             if i == 0:
+                # 首帧单独处理，确保稳定的起始状态
                 out = self.encoder(
                     x[:, :, :1, :, :],
                     feat_cache=self._enc_feat_map,
                     feat_idx=self._enc_conv_idx)
             else:
+                # 后续帧分组处理，每组4帧，利用时序连续性
                 out_ = self.encoder(
                     x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
                     feat_cache=self._enc_feat_map,
                     feat_idx=self._enc_conv_idx)
                 out = torch.cat([out, out_], 2)
+        # 分离均值和对数方差
         mu, log_var = self.conv1(out).chunk(2, dim=1)
+        # 执行归一化操作，使潜在空间分布更加稳定
         if isinstance(scale[0], torch.Tensor):
             mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(
                 1, self.z_dim, 1, 1, 1)
@@ -558,37 +614,83 @@ class WanVAE_(nn.Module):
         return mu
 
     def decode(self, z, scale):
+        """
+        从潜在表示解码重建视频。
+        
+        亮点：
+        1. 逐帧解码策略，保持因果性，适合流式处理
+        2. 高效特征缓存机制，避免重复计算
+        3. 解码器与编码器对称设计，有助于信息保留
+        
+        改进点：
+        1. 可引入条件信息指导解码过程
+        2. 考虑多尺度融合提升细节质量
+        
+        参数:
+            z: 潜在表示 [B,C,T,H,W]
+            scale: 潜在空间归一化参数 [mean, std]
+        返回:
+            out: 重建视频
+        """
         self.clear_cache()
-        # z: [b,c,t,h,w]
+        # 反归一化处理
         if isinstance(scale[0], torch.Tensor):
             z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
                 1, self.z_dim, 1, 1, 1)
         else:
             z = z / scale[1] + scale[0]
+        # 获取时间长度
         iter_ = z.shape[2]
+        # 初始卷积处理
         x = self.conv2(z)
+        # 逐帧解码，保持时序因果性
         for i in range(iter_):
             self._conv_idx = [0]
             if i == 0:
+                # 首帧解码
                 out = self.decoder(
                     x[:, :, i:i + 1, :, :],
                     feat_cache=self._feat_map,
                     feat_idx=self._conv_idx)
             else:
+                # 后续帧解码，利用特征缓存
                 out_ = self.decoder(
                     x[:, :, i:i + 1, :, :],
                     feat_cache=self._feat_map,
                     feat_idx=self._conv_idx)
+                # 拼接结果
                 out = torch.cat([out, out_], 2)
         self.clear_cache()
         return out
 
     def reparameterize(self, mu, log_var):
+        """
+        VAE重参数化技巧，在保持可微分的情况下进行采样。
+        
+        亮点：通过乘加操作优化采样过程，提高训练稳定性
+        
+        参数:
+            mu: 均值
+            log_var: 对数方差
+        返回:
+            采样得到的潜在表示
+        """
         std = torch.exp(0.5 * log_var)
         eps = torch.randn_like(std)
         return eps * std + mu
 
     def sample(self, imgs, deterministic=False):
+        """
+        从输入图像采样潜在表示。
+        
+        亮点：支持确定性模式和随机采样模式
+        
+        参数:
+            imgs: 输入图像
+            deterministic: 是否确定性采样(不加噪声)
+        返回:
+            采样得到的潜在表示
+        """
         mu, log_var = self.encode(imgs)
         if deterministic:
             return mu
@@ -596,10 +698,16 @@ class WanVAE_(nn.Module):
         return mu + std * torch.randn_like(std)
 
     def clear_cache(self):
+        """
+        清除特征缓存，为新的处理准备环境。
+        
+        亮点：高效的缓存管理机制，减少内存占用
+        """
+        # 解码器缓存
         self._conv_num = count_conv3d(self.decoder)
         self._conv_idx = [0]
         self._feat_map = [None] * self._conv_num
-        #cache encode
+        # 编码器缓存
         self._enc_conv_num = count_conv3d(self.encoder)
         self._enc_conv_idx = [0]
         self._enc_feat_map = [None] * self._enc_conv_num
@@ -607,9 +715,22 @@ class WanVAE_(nn.Module):
 
 def _video_vae(pretrained_path=None, z_dim=None, device='cpu', **kwargs):
     """
-    Autoencoder3d adapted from Stable Diffusion 1.x, 2.x and XL.
+    构建并加载预训练的视频VAE模型。
+    
+    亮点：
+    1. 使用元设备(meta device)初始化模型，减少内存占用
+    2. 灵活的配置参数，支持不同规模和性能需求的模型
+    3. 预训练权重加载机制，加速部署
+    
+    参数:
+        pretrained_path: 预训练权重路径
+        z_dim: 潜在空间维度
+        device: 计算设备
+        **kwargs: 其他模型参数
+    返回:
+        加载好权重的VAE模型
     """
-    # params
+    # 默认配置参数
     cfg = dict(
         dim=96,
         z_dim=z_dim,
@@ -618,13 +739,14 @@ def _video_vae(pretrained_path=None, z_dim=None, device='cpu', **kwargs):
         attn_scales=[],
         temperal_downsample=[False, True, True],
         dropout=0.0)
+    # 更新自定义参数
     cfg.update(**kwargs)
 
-    # init model
+    # 在meta设备上初始化模型，节省内存
     with torch.device('meta'):
         model = WanVAE_(**cfg)
 
-    # load checkpoint
+    # 加载预训练权重
     logging.info(f'loading {pretrained_path}')
     model.load_state_dict(
         torch.load(pretrained_path, map_location=device), assign=True)
@@ -633,15 +755,39 @@ def _video_vae(pretrained_path=None, z_dim=None, device='cpu', **kwargs):
 
 
 class WanVAE:
+    """
+    WanVAE对外接口类，封装了视频编码和解码功能。
+    
+    亮点：
+    1. 简化的API设计，易于集成到其他系统
+    2. 自动混合精度支持，提高性能
+    3. 预定义的归一化参数，确保编解码一致性
+    
+    改进点：
+    1. 可增加批处理支持，提高吞吐量
+    2. 考虑渐进式编解码，支持超高分辨率视频
+    3. 添加更多预处理和后处理选项
+    """
 
     def __init__(self,
                  z_dim=16,
                  vae_pth='cache/vae_step_411000.pth',
                  dtype=torch.float,
                  device="cuda"):
+        """
+        初始化WanVAE接口。
+        
+        参数:
+            z_dim: 潜在空间维度
+            vae_pth: 预训练模型路径
+            dtype: 计算精度类型
+            device: 计算设备
+        """
         self.dtype = dtype
         self.device = device
 
+        # 预定义的潜在空间归一化参数
+        # 这些参数是在大规模数据集上预计算的，确保潜在空间分布稳定
         mean = [
             -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
             0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
@@ -650,11 +796,12 @@ class WanVAE:
             2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
             3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
         ]
+        # 转换为张量并移至指定设备
         self.mean = torch.tensor(mean, dtype=dtype, device=device)
         self.std = torch.tensor(std, dtype=dtype, device=device)
         self.scale = [self.mean, 1.0 / self.std]
 
-        # init model
+        # 初始化底层模型并设置为评估模式
         self.model = _video_vae(
             pretrained_path=vae_pth,
             z_dim=z_dim,
@@ -662,7 +809,16 @@ class WanVAE:
 
     def encode(self, videos):
         """
-        videos: A list of videos each with shape [C, T, H, W].
+        编码视频到潜在空间。
+        
+        亮点：
+        1. 支持列表输入，方便批处理
+        2. 自动混合精度计算，平衡速度和精度
+        
+        参数:
+            videos: 视频列表，每个视频形状为[C,T,H,W]
+        返回:
+            潜在表示列表
         """
         with amp.autocast(dtype=self.dtype):
             return [
@@ -671,6 +827,18 @@ class WanVAE:
             ]
 
     def decode(self, zs):
+        """
+        从潜在表示解码重建视频。
+        
+        亮点：
+        1. 支持列表输入，方便批处理
+        2. 自动值域裁剪(-1,1)，确保输出合法
+        
+        参数:
+            zs: 潜在表示列表
+        返回:
+            重建视频列表
+        """
         with amp.autocast(dtype=self.dtype):
             return [
                 self.model.decode(u.unsqueeze(0),

@@ -1,10 +1,13 @@
+# 此文件的内容应与原 tokenizers.py 完全相同
+# 只需将文件重命名即可
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import html
 import string
 
 import ftfy
 import regex as re
-from transformers import AutoTokenizer
+# 移除顶层导入，改为在类中动态导入
+# from transformers import AutoTokenizer
 
 __all__ = ['HuggingfaceTokenizer']
 
@@ -42,6 +45,8 @@ class HuggingfaceTokenizer:
         self.seq_len = seq_len
         self.clean = clean
 
+        # 动态导入 AutoTokenizer，避免循环导入
+        from transformers import AutoTokenizer
         # init tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(name, **kwargs)
         self.vocab_size = self.tokenizer.vocab_size

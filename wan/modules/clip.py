@@ -8,9 +8,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
 
-from .attention import flash_attention
-from .tokenizers import HuggingfaceTokenizer
-from .xlm_roberta import XLMRoberta
+from attention import flash_attention
+from tokenizer_utils import HuggingfaceTokenizer
+from xlm_roberta import XLMRoberta
 
 __all__ = [
     'XLMRobertaCLIP',
