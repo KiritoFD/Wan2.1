@@ -309,7 +309,7 @@ class Encoder3d(nn.Module):
         for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
             # residual (+attention) blocks
             for _ in range(num_res_blocks):
-                downsamples.append(ResidualBlock(in_dim, out_dim, dropout)#残差连接设计
+                downsamples.append(ResidualBlock(in_dim, out_dim, dropout))#残差连接设计
                 if scale in attn_scales:
                     downsamples.append(AttentionBlock(out_dim))# 亮点：选择性注意力机制，平衡计算效率和表达能力
                 in_dim = out_dim
