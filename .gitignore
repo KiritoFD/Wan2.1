@@ -10,7 +10,6 @@
 *.mkv
 *.log
 *.zip
-*.pt
 *.pth
 *.ckpt
 *.safetensors
