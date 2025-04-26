@@ -47,9 +47,38 @@ class HuggingfaceTokenizer:
 
         # 动态导入 AutoTokenizer，避免循环导入
         from transformers import AutoTokenizer
-        # init tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(name, **kwargs)
-        self.vocab_size = self.tokenizer.vocab_size
+        
+        # 检查是否为本地路径（包含目录分隔符或文件扩展名）
+        import os
+        is_local_path = os.path.exists(name) or ('\\' in name) or ('/' in name)
+        
+        # init tokenizer - 根据不同情况处理路径
+        try:
+            if is_local_path:
+                # 修复Windows路径分隔符问题
+                name = os.path.normpath(name)
+                if os.path.exists(name):
+                    # 确认路径存在，使用本地路径加载
+                    self.tokenizer = AutoTokenizer.from_pretrained(name, local_files_only=True, **kwargs)
+                else:
+                    # 如果路径不存在，记录错误并尝试回退
+                    import logging
+                    logging.warning(f"Tokenizer路径不存在: {name}，尝试作为repo_id加载")
+                    self.tokenizer = AutoTokenizer.from_pretrained(name, **kwargs)
+            else:
+                # 使用默认行为 (repo_id)
+                self.tokenizer = AutoTokenizer.from_pretrained(name, **kwargs)
+            
+            self.vocab_size = self.tokenizer.vocab_size
+            
+        except Exception as e:
+            # 提供更友好的错误信息
+            import logging
+            logging.error(f"Tokenizer加载失败: {str(e)}")
+            logging.error(f"尝试加载的路径/ID: {name}")
+            logging.error(f"是否被视为本地路径: {is_local_path}")
+            # 重新抛出异常
+            raise
 
     def __call__(self, sequence, **kwargs):
         return_mask = kwargs.pop('return_mask', False)

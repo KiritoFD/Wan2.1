@@ -2,6 +2,8 @@
 *.py[cod]
 *.jpg
 *.jpeg
+*.webp
+*.pt
 *.png
 *.gif
 *.bmp
