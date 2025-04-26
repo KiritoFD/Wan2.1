@@ -156,11 +156,11 @@ def main():
     logging_level = logging.getLogger().level
     logging.getLogger().setLevel(logging.WARNING)  # 临时提高日志级别
     
-    # 启用容错模式，遇到形状不匹配时跳过而不是中止
-    trainer = FixedSizeVAECycleGANTrainer(config, fault_tolerant=True)
+    # 启用细粒度容错模式，遇到形状不匹配时只跳过单个样本而不是整个批次
+    trainer = FixedSizeVAECycleGANTrainer(config, fault_tolerant=True, skip_individual=True)
     logging.getLogger().setLevel(logging_level)  # 恢复原始日志级别
     
-    logging.info("使用固定尺寸网络模型（已启用容错模式）")
+    logging.info("使用固定尺寸网络模型（已启用细粒度容错模式）")
     
     # 加载预训练模型（如果指定）
     if config.resume_path:

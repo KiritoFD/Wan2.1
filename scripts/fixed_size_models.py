@@ -174,13 +174,15 @@ class GanLoss(nn.Module):
 
 class FixedSizeVAECycleGANTrainer(VAECycleGANTrainer):
     """固定尺寸VAE CycleGAN训练器"""
-    def __init__(self, config, fault_tolerant=False):
+    def __init__(self, config, fault_tolerant=False, skip_individual=False):
         # 初始化基本属性而不调用父类构造函数
         self.config = config
         self.device = torch.device(config.device)
         self.fault_tolerant = fault_tolerant  # 容错模式标志
+        self.skip_individual = skip_individual  # 启用单个样本跳过模式
         
-        # 记录已跳过的批次数量，用于调试
+        # 统计量
+        self.skipped_samples = 0
         self.skipped_batches = 0
         
         # 分析数据集中的形状
@@ -195,8 +197,8 @@ class FixedSizeVAECycleGANTrainer(VAECycleGANTrainer):
         self.criterion_GAN = GanLoss().to(self.device)
         
         # 设置经验回放缓冲区
-        self.fake_A_buffer = ReplayBuffer(config.buffer_size)
-        self.fake_B_buffer = ReplayBuffer(config.buffer_size)
+        self.fake_A_buffer = AdaptiveReplayBuffer(config.buffer_size)
+        self.fake_B_buffer = AdaptiveReplayBuffer(config.buffer_size)
         
         # 设置学习率调度器
         self.schedulers = []
@@ -274,13 +276,13 @@ class FixedSizeVAECycleGANTrainer(VAECycleGANTrainer):
     
     def _train_batch(self, real_A_dict, real_B_dict):
         """重写训练批次方法，能够安全处理不同形状的张量"""
+        # 设置为训练模式
+        self.G_AB.train()
+        self.G_BA.train()
+        self.D_A.train()
+        self.D_B.train()
+        
         try:
-            # 设置为训练模式
-            self.G_AB.train()
-            self.G_BA.train()
-            self.D_A.train()
-            self.D_B.train()
-            
             # 从字典中获取特征张量
             if 'feature' in real_A_dict:
                 real_A = real_A_dict['feature']
@@ -311,112 +313,213 @@ class FixedSizeVAECycleGANTrainer(VAECycleGANTrainer):
                 logging.info(f"原始输入形状: A = {real_A.shape}, B = {real_B.shape}")
                 self._logged_shapes = True
             
-            # 检查形状是否匹配预期
-            if self.fault_tolerant:
-                # 如果形状不匹配且启用了容错模式，则尝试处理或跳过
-                if len(real_A.shape) == 5 and real_A.shape[3] != self.shape_A[2] or real_A.shape[4] != self.shape_A[3]:
-                    self.skipped_batches += 1
-                    if self.skipped_batches % 100 == 1:  # 每100个跳过的批次只记录一次，避免日志过多
-                        logging.warning(f"跳过形状异常的批次 A: {real_A.shape} (已跳过 {self.skipped_batches} 批次)")
-                    return self._get_default_losses()
-                
-                if len(real_B.shape) == 5 and real_B.shape[3] != self.shape_B[2] or real_B.shape[4] != self.shape_B[3]:
+            # 如果启用了细粒度容错模式并且批次大小大于1
+            if self.fault_tolerant and self.skip_individual and real_A.shape[0] > 1:
+                return self._train_batch_with_individual_skipping(real_A, real_B)
+            
+            # 处理5维输入张量 [批次, 通道, 子通道, 高, 宽]
+            if len(real_A.shape) == 5:
+                batch_size = real_A.shape[0]
+                # 将5维张量转换为4维 [批次, 通道*子通道, 高, 宽]
+                real_A = real_A.reshape(batch_size, 
+                                     real_A.shape[1] * real_A.shape[2], 
+                                     real_A.shape[3], 
+                                     real_A.shape[4])
+            
+            if len(real_B.shape) == 5:
+                batch_size = real_B.shape[0]
+                # 将5维张量转换为4维
+                real_B = real_B.reshape(batch_size, 
+                                    real_B.shape[1] * real_B.shape[2], 
+                                    real_B.shape[3], 
+                                    real_B.shape[4])
+            
+            # 检查批次是否有效
+            if self._is_invalid_batch(real_A) or self._is_invalid_batch(real_B):
+                if self.fault_tolerant:
                     self.skipped_batches += 1
                     if self.skipped_batches % 100 == 1:
-                        logging.warning(f"跳过形状异常的批次 B: {real_B.shape} (已跳过 {self.skipped_batches} 批次)")
+                        logging.warning(f"跳过无效批次 (已跳过 {self.skipped_batches} 批次)")
                     return self._get_default_losses()
+                else:
+                    logging.error(f"无效的批次形状: A = {real_A.shape}, B = {real_B.shape}")
+                    raise ValueError("无效的批次形状")
             
-            # 前向传播 - 生成器和判别器直接处理5D输入
-            fake_B = self.G_AB(real_A)
-            rec_A = self.G_BA(fake_B)
-            fake_A = self.G_BA(real_B)
-            rec_B = self.G_AB(fake_A)
+            # 正常的批次训练逻辑
+            return self._process_valid_batch(real_A, real_B)
             
-            same_A = self.G_BA(real_A)
-            same_B = self.G_AB(real_B)
-            
-            # 更新生成器
-            self.optimizer_G.zero_grad()
-            
-            # 身份损失
-            loss_identity_A = self.criterion_identity(same_A, real_A) * self.config.lambda_identity
-            loss_identity_B = self.criterion_identity(same_B, real_B) * self.config.lambda_identity
-            
-            # GAN损失
-            loss_GAN_AB = self.criterion_GAN(self.D_B(fake_B), True)
-            loss_GAN_BA = self.criterion_GAN(self.D_A(fake_A), True)
-            
-            # 循环一致性损失
-            loss_cycle_A = self.criterion_cycle(rec_A, real_A) * self.config.lambda_cycle
-            loss_cycle_B = self.criterion_cycle(rec_B, real_B) * self.config.lambda_cycle
-            
-            # 总生成器损失
-            loss_G = loss_identity_A + loss_identity_B + loss_GAN_AB + loss_GAN_BA + loss_cycle_A + loss_cycle_B
-            loss_G.backward()
-            self.optimizer_G.step()
-            
-            # 更新判别器A
-            self.optimizer_D_A.zero_grad()
-            
-            # 从缓冲区获取假样本
-            fake_A_buffer = self.fake_A_buffer.push_and_pop(fake_A)
-            
-            # 真实样本损失
-            pred_real_A = self.D_A(real_A)
-            loss_D_real_A = self.criterion_GAN(pred_real_A, True)
-            
-            # 生成样本损失
-            pred_fake_A = self.D_A(fake_A_buffer.detach())
-            loss_D_fake_A = self.criterion_GAN(pred_fake_A, False)
-            
-            # 总判别器A损失
-            loss_D_A = (loss_D_real_A + loss_D_fake_A) * 0.5
-            loss_D_A.backward()
-            self.optimizer_D_A.step()
-            
-            # 更新判别器B
-            self.optimizer_D_B.zero_grad()
-            
-            # 从缓冲区获取假样本
-            fake_B_buffer = self.fake_B_buffer.push_and_pop(fake_B)
-            
-            # 真实样本损失
-            pred_real_B = self.D_B(real_B)
-            loss_D_real_B = self.criterion_GAN(pred_real_B, True)
-            
-            # 生成样本损失
-            pred_fake_B = self.D_B(fake_B_buffer.detach())
-            loss_D_fake_B = self.criterion_GAN(pred_fake_B, False)
-            
-            # 总判别器B损失
-            loss_D_B = (loss_D_real_B + loss_D_fake_B) * 0.5
-            loss_D_B.backward()
-            self.optimizer_D_B.step()
-            
-            # 返回损失值 - 确保键名与原始VAECycleGANTrainer一致
-            return {
-                # 总损失
-                "G": loss_G.item(),  # 注意这里的键改为 "G" 而非 "loss_G"
-                "D_A": loss_D_A.item(),
-                "D_B": loss_D_B.item(),
-                
-                # 详细损失
-                "G_identity_A": loss_identity_A.item(),
-                "G_identity_B": loss_identity_B.item(),
-                "G_GAN_AB": loss_GAN_AB.item(),
-                "G_GAN_BA": loss_GAN_BA.item(), 
-                "G_cycle_A": loss_cycle_A.item(),
-                "G_cycle_B": loss_cycle_B.item(),
-            }
-        
         except Exception as e:
             if self.fault_tolerant:
                 self.skipped_batches += 1
                 if self.skipped_batches % 100 == 1:
-                    logging.warning(f"训练批次异常，已跳过: {e} (已跳过 {self.skipped_batches} 批次)")
+                    logging.warning(f"批次处理异常，已跳过: {e} (已跳过 {self.skipped_batches} 批次)")
                 return self._get_default_losses()
             else:
                 raise e
+    
+    def _is_invalid_batch(self, tensor):
+        """检查批次是否有效"""
+        # 检查形状维度
+        if len(tensor.shape) < 4:
+            return True
+        
+        # 批次大小为0
+        if tensor.shape[0] == 0:
+            return True
+            
+        # 检查是否有NaN或inf值
+        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+            return True
+            
+        return False
+    
+    def _train_batch_with_individual_skipping(self, real_A, real_B):
+        """对批次中的每个样本单独处理，跳过有问题的样本"""
+        batch_size = min(real_A.shape[0], real_B.shape[0])
+        
+        # 累积总损失
+        batch_losses = {
+            "G": 0.0,
+            "D_A": 0.0,
+            "D_B": 0.0,
+            "G_identity_A": 0.0,
+            "G_identity_B": 0.0,
+            "G_GAN_AB": 0.0,
+            "G_GAN_BA": 0.0,
+            "G_cycle_A": 0.0,
+            "G_cycle_B": 0.0,
+        }
+        
+        valid_samples = 0
+        
+        # 处理每个样本
+        for i in range(batch_size):
+            # 提取单个样本
+            sample_A = real_A[i:i+1]
+            sample_B = real_B[i:i+1]
+            
+            try:
+                # 处理单个样本
+                if len(sample_A.shape) == 5:
+                    sample_A = sample_A.reshape(1, sample_A.shape[1] * sample_A.shape[2], 
+                                              sample_A.shape[3], sample_A.shape[4])
+                
+                if len(sample_B.shape) == 5:
+                    sample_B = sample_B.reshape(1, sample_B.shape[1] * sample_B.shape[2],
+                                              sample_B.shape[3], sample_B.shape[4])
+                
+                # 检查单个样本是否有效
+                if self._is_invalid_batch(sample_A) or self._is_invalid_batch(sample_B):
+                    self.skipped_samples += 1
+                    continue
+                
+                # 处理有效样本
+                sample_losses = self._process_valid_batch(sample_A, sample_B)
+                
+                # 累加损失
+                for key in batch_losses:
+                    if key in sample_losses:
+                        batch_losses[key] += sample_losses[key]
+                
+                valid_samples += 1
+                
+            except Exception as e:
+                self.skipped_samples += 1
+                if self.skipped_samples % 100 == 0:
+                    logging.warning(f"样本处理异常，已跳过: {e} (已跳过 {self.skipped_samples} 个样本)")
+        
+        # 计算平均损失
+        if valid_samples > 0:
+            for key in batch_losses:
+                batch_losses[key] /= valid_samples
+        else:
+            # 如果所有样本都无效，则返回默认损失
+            return self._get_default_losses()
+        
+        return batch_losses
+    
+    def _process_valid_batch(self, real_A, real_B):
+        """处理有效的批次"""
+        # 前向传播
+        fake_B = self.G_AB(real_A)
+        rec_A = self.G_BA(fake_B)
+        fake_A = self.G_BA(real_B)
+        rec_B = self.G_AB(fake_A)
+        
+        # 身份映射
+        same_A = self.G_BA(real_A)
+        same_B = self.G_AB(real_B)
+        
+        # 更新生成器
+        self.optimizer_G.zero_grad()
+        
+        # 身份损失
+        loss_identity_A = self.criterion_identity(same_A, real_A) * self.config.lambda_identity
+        loss_identity_B = self.criterion_identity(same_B, real_B) * self.config.lambda_identity
+        
+        # GAN损失
+        loss_GAN_AB = self.criterion_GAN(self.D_B(fake_B), True)
+        loss_GAN_BA = self.criterion_GAN(self.D_A(fake_A), True)
+        
+        # 循环一致性损失
+        loss_cycle_A = self.criterion_cycle(rec_A, real_A) * self.config.lambda_cycle
+        loss_cycle_B = self.criterion_cycle(rec_B, real_B) * self.config.lambda_cycle
+        
+        # 总生成器损失
+        loss_G = loss_identity_A + loss_identity_B + loss_GAN_AB + loss_GAN_BA + loss_cycle_A + loss_cycle_B
+        loss_G.backward()
+        self.optimizer_G.step()
+        
+        # 更新判别器A
+        self.optimizer_D_A.zero_grad()
+        
+        # 从缓冲区获取假样本
+        fake_A_buffer = self.fake_A_buffer.push_and_pop(fake_A)
+        
+        # 真实样本损失
+        pred_real_A = self.D_A(real_A)
+        loss_D_real_A = self.criterion_GAN(pred_real_A, True)
+        
+        # 生成样本损失
+        pred_fake_A = self.D_A(fake_A_buffer.detach())
+        loss_D_fake_A = self.criterion_GAN(pred_fake_A, False)
+        
+        # 总判别器A损失
+        loss_D_A = (loss_D_real_A + loss_D_fake_A) * 0.5
+        loss_D_A.backward()
+        self.optimizer_D_A.step()
+        
+        # 更新判别器B
+        self.optimizer_D_B.zero_grad()
+        
+        # 从缓冲区获取假样本
+        fake_B_buffer = self.fake_B_buffer.push_and_pop(fake_B)
+        
+        # 真实样本损失
+        pred_real_B = self.D_B(real_B)
+        loss_D_real_B = self.criterion_GAN(pred_real_B, True)
+        
+        # 生成样本损失
+        pred_fake_B = self.D_B(fake_B_buffer.detach())
+        loss_D_fake_B = self.criterion_GAN(pred_fake_B, False)
+        
+        # 总判别器B损失
+        loss_D_B = (loss_D_real_B + loss_D_fake_B) * 0.5
+        loss_D_B.backward()
+        self.optimizer_D_B.step()
+        
+        # 返回损失值
+        return {
+            "G": loss_G.item(),
+            "D_A": loss_D_A.item(),
+            "D_B": loss_D_B.item(),
+            "G_identity_A": loss_identity_A.item(),
+            "G_identity_B": loss_identity_B.item(),
+            "G_GAN_AB": loss_GAN_AB.item(),
+            "G_GAN_BA": loss_GAN_BA.item(), 
+            "G_cycle_A": loss_cycle_A.item(),
+            "G_cycle_B": loss_cycle_B.item(),
+        }
     
     def _get_default_losses(self):
         """返回默认的损失值，用于跳过异常批次时"""
@@ -431,141 +534,38 @@ class FixedSizeVAECycleGANTrainer(VAECycleGANTrainer):
             "G_cycle_A": 0.0,
             "G_cycle_B": 0.0,
         }
-    
-    def _train_epoch(self, dataloader_A, dataloader_B, epoch_losses, pbar=None):
-        """重写训练轮次方法，确保损失键匹配"""
-        batch_count = 0
-        
-        # 获取迭代器
-        iter_A = iter(dataloader_A)
-        iter_B = iter(dataloader_B)
-        max_batches = min(len(dataloader_A), len(dataloader_B))
-        
-        for _ in range(max_batches):
-            try:
-                # 获取批次数据
-                batch_A = next(iter_A)
-                batch_B = next(iter_B)
-                
-                # 训练批次
-                batch_losses = self._train_batch(batch_A, batch_B)
-                
-                # 累加损失
-                for k, v in batch_losses.items():
-                    if k not in epoch_losses:
-                        epoch_losses[k] = 0
-                    epoch_losses[k] += v
-                
-                batch_count += 1
-                
-                # 更新进度条
-                if pbar is not None:
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        "G": batch_losses["G"],
-                        "D_A": batch_losses["D_A"], 
-                        "D_B": batch_losses["D_B"]
-                    })
-                
-            except StopIteration:
-                break
-                
-        return batch_count
-    
-    def train(self, dataloader_A, dataloader_B):
-        """重写训练方法，以兼容我们的损失键格式"""
-        self.G_AB.train()
-        self.G_BA.train()
-        self.D_A.train()
-        self.D_B.train()
-        
-        losses = {}
-        
-        for epoch in range(self.config.n_epochs):
-            # 初始化当前轮次的损失
-            epoch_losses = {}
-            
-            # 创建进度条
-            with tqdm(total=min(len(dataloader_A), len(dataloader_B)), desc=f"Epoch {epoch+1}/{self.config.n_epochs}") as pbar:
-                # 训练一个轮次
-                batch_count = self._train_epoch(dataloader_A, dataloader_B, epoch_losses, pbar)
-            
-            # 计算平均损失
-            for k in epoch_losses:
-                epoch_losses[k] /= batch_count
-                
-            # 收集所有轮次的损失
-            for k, v in epoch_losses.items():
-                if k not in losses:
-                    losses[k] = []
-                losses[k].append(v)
-                
-            # 日志
-            log_msg = f"Epoch {epoch+1}/{self.config.n_epochs}, "
-            log_msg += ", ".join([f"{k}: {v:.4f}" for k, v in epoch_losses.items()])
-            logging.info(log_msg)
-            
-            # 更新学习率
-            for scheduler in self.schedulers:
-                scheduler.step()
-                
-            # 保存样本
-            if (epoch + 1) % self.config.sample_freq == 0 or epoch == self.config.n_epochs - 1:
-                self.save_samples(epoch + 1, dataloader_A, dataloader_B)
-                
-            # 保存模型
-            if (epoch + 1) % self.config.save_freq == 0 or epoch == self.config.n_epochs - 1:
-                self.save_models(epoch + 1)
-                
-        return losses
 
-# 改进的经验回放缓冲区，可以处理不同形状的张量
-class ReplayBuffer:
+# 改进的经验回放缓冲区，能够更好地处理不同形状的张量
+class AdaptiveReplayBuffer:
     def __init__(self, max_size=50):
         self.max_size = max_size
-        self.buffer = []  # 使用列表而不是固定大小的缓冲区
-        self.buffer_shapes = []  # 记录缓冲区中每个张量的形状
+        # 使用字典按形状存储缓冲区数据
+        self.buffers = {}  # shape_key -> [tensors]
     
     def push_and_pop(self, data):
-        """添加新数据到缓冲区并返回历史数据+新数据的混合
-        
-        对于形状不匹配的张量，直接返回输入数据以避免拼接错误
-        """
+        """添加新数据到缓冲区并返回历史数据+新数据的混合"""
         result = data.clone()
         shape_key = tuple(data.shape)
         
-        # 只处理相同形状的缓存项以避免拼接错误
-        matching_indices = [i for i, shape in enumerate(self.buffer_shapes) if shape == shape_key]
+        # 如果缓冲区中没有该形状的数据，则创建新的缓冲区
+        if shape_key not in self.buffers:
+            self.buffers[shape_key] = []
         
-        if len(matching_indices) >= 1:
-            # 随机选择一个匹配形状的缓存项
-            random_idx = np.random.choice(matching_indices)
+        buffer = self.buffers[shape_key]
+        
+        if len(buffer) < self.max_size:
+            # 缓冲区未满，添加新数据
+            buffer.append(data.clone().detach())
+        else:
+            # 缓冲区已满，随机替换一个数据项
+            idx = np.random.randint(0, self.max_size)
+            buffer[idx] = data.clone().detach()
             
-            # 随机决定是否替换一个数据点
+            # 随机决定是否替换结果中的一个样本
             if np.random.uniform() > 0.5:
                 i = np.random.randint(0, data.shape[0])
-                temp = self.buffer[random_idx][i].clone().unsqueeze(0)
-                self.buffer[random_idx][i] = data[i].clone()
+                result[i] = buffer[np.random.randint(0, self.max_size)][i]
                 
-                # 构建包含历史数据的返回结果
-                if i > 0:
-                    front = result[:i]
-                    back = result[i+1:]
-                    result = torch.cat([front, temp, back], dim=0)
-                else:
-                    result = torch.cat([temp, result[1:]], dim=0)
-                
-        # 如果缓冲区未满，则添加新数据
-        if len(self.buffer) < self.max_size:
-            self.buffer.append(data.clone())
-            self.buffer_shapes.append(shape_key)
-        else:
-            # 如果缓冲区已满但没有形状匹配的项，则随机替换一项
-            if not matching_indices:
-                idx = np.random.randint(0, self.max_size)
-                self.buffer[idx] = data.clone()
-                self.buffer_shapes[idx] = shape_key
-            
         return result
 
 # 学习率调整器
