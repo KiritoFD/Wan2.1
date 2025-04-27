@@ -523,7 +523,7 @@ class StyleTransferAAE:
             torch.nn.utils.clip_grad_norm_(group['params'], max_norm)
             
     def train_stable(self, dataloader_a, dataloader_b, epochs=100, save_dir=None, lambda_gp=2.0, 
-                     clip_value=1.0, lr_decay=0.995):
+                     clip_value=1.0, lr_decay=0.995, start_epoch=0):
         """增强稳定性的训练方法，专为风格向量映射设计"""
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
@@ -552,9 +552,10 @@ class StyleTransferAAE:
         lr_scheduler_dis = torch.optim.lr_scheduler.ExponentialLR(self.opt_Dis, gamma=lr_decay)
         lr_scheduler_m = torch.optim.lr_scheduler.ExponentialLR(self.opt_M, gamma=lr_decay)
 
-        # 设置初始较小学习率，让训练更稳定
-        for param_group in self.opt_Dis.param_groups:
-            param_group['lr'] = param_group['lr'] * 0.5
+        # 设置初始较小学习率，让训练更稳定 - 只在开始新训练时执行
+        if start_epoch == 0:
+            for param_group in self.opt_Dis.param_groups:
+                param_group['lr'] = param_group['lr'] * 0.5
         
         # 修改版梯度惩罚函数
         def wasserstein_gp(real_samples, fake_samples):
@@ -586,19 +587,20 @@ class StyleTransferAAE:
             return gradient_penalty
         
         # 开始训练
-        logging.info(f"开始稳定训练模式，共{epochs}个周期，梯度裁剪值={clip_value}")
+        logging.info(f"开始稳定训练模式，共{epochs}个周期，从第{start_epoch+1}轮开始，梯度裁剪值={clip_value}")
         start_time = time.time()
         
         best_loss = float('inf')
         no_improve_epochs = 0
         
-        for epoch in range(epochs):
+        # 从指定epoch开始训练
+        for epoch in range(start_epoch, start_epoch + epochs):
             # 累积损失
             epoch_recon = 0
             epoch_disc = 0
             epoch_gen = 0
             
-            pbar = tqdm(range(steps_per_epoch), desc=f"Epoch {epoch+1}/{epochs}")
+            pbar = tqdm(range(steps_per_epoch), desc=f"Epoch {epoch+1}/{start_epoch+epochs}")
             for step in pbar:
                 # 获取数据
                 real_a = next(iter_a).to(self.device)
@@ -730,7 +732,7 @@ class StyleTransferAAE:
             
             # 日志输出
             logging.info(
-                f"Epoch {epoch+1}/{epochs}, "
+                f"Epoch {epoch+1}/{start_epoch+epochs}, "
                 f"重建: {avg_recon:.4f}, "
                 f"判别器: {avg_disc:.4f}, "
                 f"生成器: {avg_gen:.4f}"
@@ -749,13 +751,13 @@ class StyleTransferAAE:
                 no_improve_epochs = 0
                 # 保存最佳模型
                 if save_dir:
-                    self.save_model(os.path.join(save_dir, "best_model.pth"))
+                    self.save_model(os.path.join(save_dir, "best_model.pth"), current_epoch=epoch)
             else:
                 no_improve_epochs += 1
             
-            # 定期保存检查点
+            # 定期保存检查点，并添加当前epoch信息
             if save_dir and (epoch + 1) % 10 == 0:
-                self.save_checkpoint(os.path.join(save_dir, f"checkpoint_{epoch+1}.pt"))
+                self.save_checkpoint(os.path.join(save_dir, f"checkpoint_{epoch+1}.pt"), current_epoch=epoch)
             
             # 如果连续15个epoch没有改善，提前停止
             if no_improve_epochs >= 15:
@@ -767,24 +769,32 @@ class StyleTransferAAE:
         elapsed = time.time() - start_time
         logging.info(f"训练完成，用时: {elapsed:.2f}秒")
         
+        # 返回历史记录和最后的epoch
         return self.history
     
-    def save_model(self, path):
-        """保存模型"""
-        torch.save({
+    def save_model(self, path, current_epoch=None):
+        """保存模型，包含当前训练状态"""
+        save_dict = {
             'encoder': self.encoder.state_dict(),
             'decoder': self.decoder.state_dict(),
             'discriminator': self.discriminator.state_dict(),
             'mapper': self.mapper.state_dict(),
             'latent_dim': self.latent_dim,
             'history': self.history,
-            'is_trained': self.is_trained
-        }, path)
+            'is_trained': self.is_trained,
+            'model_state': self.state_dict()  # 添加整体模型状态
+        }
+        
+        # 保存当前epoch
+        if current_epoch is not None:
+            save_dict['epoch'] = current_epoch
+            
+        torch.save(save_dict, path)
         logging.info(f"模型已保存到: {path}")
         
-    def save_checkpoint(self, path):
-        """保存检查点"""
-        torch.save({
+    def save_checkpoint(self, path, current_epoch=None):
+        """保存检查点，包含完整训练状态"""
+        save_dict = {
             'encoder': self.encoder.state_dict(),
             'decoder': self.decoder.state_dict(),
             'discriminator': self.discriminator.state_dict(),
@@ -794,11 +804,19 @@ class StyleTransferAAE:
             'opt_Dis': self.opt_Dis.state_dict(),
             'opt_M': self.opt_M.state_dict(),
             'history': self.history,
-            'is_trained': self.is_trained
-        }, path)
+            'is_trained': self.is_trained,
+            'model_state': self.state_dict()  # 添加整体模型状态
+        }
+        
+        # 保存当前epoch
+        if current_epoch is not None:
+            save_dict['epoch'] = current_epoch
+            
+        torch.save(save_dict, path)
+        logging.info(f"检查点已保存到: {path}")
         
     def load_model(self, path, device=None):
-        """加载模型"""
+        """加载模型，包括训练状态"""
         if device:
             self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
             
@@ -825,6 +843,9 @@ class StyleTransferAAE:
             
         self.is_trained = state.get('is_trained', True)
         
+        # 加载当前epoch信息（如果有）
+        current_epoch = state.get('epoch', 0)
+        
         # 设为评估模式
         self.encoder.eval()
         self.decoder.eval()
@@ -832,31 +853,27 @@ class StyleTransferAAE:
         self.mapper.eval()
         
         logging.info(f"模型已从 {path} 加载")
-        
-    def plot_history(self, save_dir=None):
-        """绘制训练历史"""
-        plt.figure(figsize=(12, 5))
-        
-        # 重建损失
-        plt.subplot(1, 2, 1)
-        plt.plot(self.history['recon_loss'])
-        plt.title('重建损失')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        
-        # 对抗损失
-        plt.subplot(1, 2, 2)
-        plt.plot(self.history['disc_loss'], label='判别器')
-        plt.plot(self.history['gen_loss'], label='生成器')
-        plt.title('对抗损失')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend()
-        
-        plt.tight_layout()
-        
-        if save_dir:
-            plt.savefig(os.path.join(save_dir, "training_history.png"))
-            plt.close()
-        else:
-            plt.show()
+        if current_epoch > 0:
+            logging.info(f"继续训练将从第 {current_epoch+1} 轮开始")
+            
+        return current_epoch  # 返回当前epoch，便于继续训练
+
+    def state_dict(self):
+        """获取模型的状态字典"""
+        return {
+            'encoder': self.encoder.state_dict(),
+            'decoder': self.decoder.state_dict(),
+            'discriminator': self.discriminator.state_dict(),
+            'mapper': self.mapper.state_dict()
+        }
+
+    def load_state_dict(self, state_dict):
+        """从状态字典加载模型"""
+        if 'encoder' in state_dict:
+            self.encoder.load_state_dict(state_dict['encoder'])
+        if 'decoder' in state_dict:
+            self.decoder.load_state_dict(state_dict['decoder'])
+        if 'discriminator' in state_dict:
+            self.discriminator.load_state_dict(state_dict['discriminator'])
+        if 'mapper' in state_dict:
+            self.mapper.load_state_dict(state_dict['mapper'])
