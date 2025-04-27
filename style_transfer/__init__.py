@@ -1,8 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-风格转换模块
-"""
+# 风格转换模块
 
 from .model import StyleTransferAAE
 from .datasets import StyleDataset
