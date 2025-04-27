@@ -61,6 +61,52 @@ def parse_args():
     
     return parser.parse_args()
 
+def inspect_pt_file(file_path):
+    """检查.pt文件的有效性和内容"""
+    try:
+        # 检查文件是否存在和大小
+        if not os.path.exists(file_path):
+            return False, f"文件不存在: {file_path}"
+        
+        file_size = os.path.getsize(file_path) / (1024*1024)  # MB
+        if file_size < 0.001:  # 小于1KB
+            return False, f"文件可能是空的: {file_path} (大小 {file_size:.2f}MB)"
+        
+        logging.info(f"检查文件: {file_path} (大小: {file_size:.2f}MB)")
+        
+        # 尝试简单加载文件
+        try:
+            data = torch.load(file_path, map_location='cpu')
+        except Exception as e:
+            return False, f"无法加载文件: {str(e)}"
+        
+        # 检查基本结构
+        if not isinstance(data, dict):
+            return False, f"文件内容不是字典类型: {type(data)}"
+        
+        # 检查是否包含features键
+        if 'features' not in data:
+            keys = list(data.keys())
+            return False, f"文件中缺少'features'键，包含的键: {keys}"
+        
+        # 检查features的类型和形状
+        features = data['features']
+        if isinstance(features, torch.Tensor):
+            shape = features.shape
+        elif isinstance(features, list) and all(isinstance(x, torch.Tensor) for x in features):
+            shape = [x.shape for x in features[:3]]
+            shape = f"{shape}... (共{len(features)}项)"
+        else:
+            return False, f"features不是预期的张量类型: {type(features)}"
+        
+        # 返回验证成功和基本信息
+        return True, f"文件验证通过，形状: {shape}"
+        
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        return False, f"检查文件时出错: {str(e)}\n{tb}"
+
 def main():
     """主函数"""
     args = parse_args()
@@ -82,20 +128,28 @@ def main():
     logging.info(f"开始训练，参数: {args}")
     logging.info(f"日志将保存到: {log_file}")
     
-    # 检查文件是否存在
+    # 详细检查输入文件
+    logging.info("验证输入文件...")
     for file_path in [args.style_a, args.style_b]:
-        if not os.path.exists(file_path):
-            logging.error(f"文件不存在: {file_path}")
+        success, message = inspect_pt_file(file_path)
+        if not success:
+            logging.error(message)
             return
+        else:
+            logging.info(message)
     
     # 加载数据集
     try:
+        logging.info("加载风格A数据集...")
         dataset_a = StyleDataset(args.style_a)
+        
+        logging.info("加载风格B数据集...")
         dataset_b = StyleDataset(args.style_b)
         
         # 检查数据集特征形状
         if dataset_a.feature_shape != dataset_b.feature_shape:
             logging.warning(f"两个数据集的特征形状不一致: {dataset_a.feature_shape} vs {dataset_b.feature_shape}")
+            logging.warning("这可能导致训练问题，但尝试继续...")
         
         # 分割训练集和验证集
         train_size_a = int((1 - args.valid_split) * len(dataset_a))
@@ -107,10 +161,10 @@ def main():
         train_dataset_b, valid_dataset_b = random_split(dataset_b, [train_size_b, valid_size_b])
         
         # 创建数据加载器
-        train_loader_a = DataLoader(train_dataset_a, batch_size=args.batch_size, shuffle=True)
-        train_loader_b = DataLoader(train_dataset_b, batch_size=args.batch_size, shuffle=True)
-        valid_loader_a = DataLoader(valid_dataset_a, batch_size=args.batch_size)
-        valid_loader_b = DataLoader(valid_dataset_b, batch_size=args.batch_size)
+        train_loader_a = DataLoader(train_dataset_a, batch_size=args.batch_size, shuffle=True, num_workers=0)
+        train_loader_b = DataLoader(train_dataset_b, batch_size=args.batch_size, shuffle=True, num_workers=0)
+        valid_loader_a = DataLoader(valid_dataset_a, batch_size=args.batch_size, num_workers=0)
+        valid_loader_b = DataLoader(valid_dataset_b, batch_size=args.batch_size, num_workers=0)
         
         logging.info(f"数据集加载完成:")
         logging.info(f"  - 风格A: 训练 {len(train_dataset_a)} 样本, 验证 {len(valid_dataset_a)} 样本")
@@ -118,6 +172,8 @@ def main():
         
     except Exception as e:
         logging.error(f"加载数据集时出错: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
         return
     
     # 初始化模型

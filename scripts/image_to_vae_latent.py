@@ -12,7 +12,6 @@
 - image_paths: list of str，图像文件路径列表，与features对应
 - metadata: dict，包含处理参数和版本信息
 """
-
 import os
 import sys
 import argparse
@@ -26,7 +25,7 @@ import torch.nn.functional as F
 import functools
 import warnings
 from tqdm import tqdm
-
+import gc
 # 忽略PIL警告
 warnings.filterwarnings("ignore", category=UserWarning, module='PIL.TiffImagePlugin')
 
@@ -214,257 +213,326 @@ def fix_amp_warnings():
         return torch.autocast('cuda', *args, **kwargs)
     torch.cuda.amp.autocast = new_autocast
 
+def safe_save_pt(data, file_path):
+    """安全保存PT文件，避免数据损坏"""
+    try:
+        # 使用临时文件先保存，成功后再替换原文件
+        temp_file = file_path + ".tmp"
+        
+        # 确保输出目录存在
+        os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
+        
+        # 使用原子操作保存数据
+        torch.save(data, temp_file)
+        
+        # 验证保存的文件是否可以正常加载
+        try:
+            test_load = torch.load(temp_file, map_location='cpu')
+            # 验证数据完整性
+            if 'features' not in test_load and 'features_chunk' not in test_load:
+                raise ValueError("保存的数据缺少features或features_chunk字段")
+        except Exception as e:
+            logging.error(f"验证保存文件失败: {e}")
+            raise
+        
+        # 成功验证后，替换原文件
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        os.rename(temp_file, file_path)
+        
+        return True
+    except Exception as e:
+        logging.error(f"安全保存文件失败: {e}")
+        # 如果临时文件存在，尝试删除
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+        return False
+
 def process_image_batch(image_paths_batch, vae, clip_model, args, input_size=None, batch_index=None):
     """处理一批图像并返回VAE编码后的特征"""
     start_time = time.time()
     batch_prefix = f"批次 {batch_index}" if batch_index is not None else ""
-
-    # 使用CLIP处理图像
+    
+    # 计算批次大小，根据可用内存动态调整
+    clip_batch_size = min(args.clip_batch_size, 8) if args.device.startswith('cuda') else args.clip_batch_size
+    
+    # 使用CLIP处理图像 - 优化批次处理
     if args.verbose:
         logging.info(f"{batch_prefix}：使用CLIP提取图像特征...")
-    clip_features, valid_paths = process_images_with_clip(
-        clip_model, image_paths_batch, args.device, 
-        args.clip_batch_size, input_size,
-        show_progress=not args.no_progress
-    )
-    if clip_features is None:
-        logging.error(f"{batch_prefix}：无法提取CLIP特征")
+    
+    # 分批处理CLIP特征提取，减少内存占用
+    all_clip_features = []
+    all_valid_paths = []
+    
+    # 创建进度条
+    pbar = tqdm(total=len(image_paths_batch), desc=f"{batch_prefix}：CLIP特征提取", disable=not args.verbose and args.no_progress)
+    
+    for i in range(0, len(image_paths_batch), clip_batch_size):
+        # 每批次处理
+        batch_paths = image_paths_batch[i:i + clip_batch_size]
+        try:
+            mini_features, mini_paths = process_images_with_clip(
+                clip_model, batch_paths, args.device, 
+                clip_batch_size, input_size,
+                show_progress=False  # 使用外部进度条
+            )
+            if mini_features is not None:
+                all_clip_features.append(mini_features)
+                all_valid_paths.extend(mini_paths)
+            
+            # 更新总进度条
+            pbar.update(len(batch_paths))
+            
+            # 立即清理内存
+            if args.device.startswith('cuda'):
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            logging.error(f"{batch_prefix}：处理CLIP批次 {i//clip_batch_size} 时出错: {e}")
+            # 继续处理下一批
+            pbar.update(len(batch_paths))
+    
+    pbar.close()
+    
+    # 合并所有CLIP特征
+    if all_clip_features:
+        try:
+            clip_features = torch.cat(all_clip_features, dim=0)
+            valid_paths = all_valid_paths
+            
+            # 立即清理中间结果
+            del all_clip_features, all_valid_paths
+        except Exception as e:
+            logging.error(f"{batch_prefix}：合并CLIP特征时出错: {e}")
+            return None, None
+    else:
+        logging.error(f"{batch_prefix}：无法提取任何CLIP特征")
         return None, None
-    image_paths_batch = valid_paths
-    # 更新图像路径为有效路径
+    
+    image_paths_batch = valid_paths  # 更新为有效路径
+    
+    # 输出处理信息
     if args.verbose:
         logging.info(f"{batch_prefix}：成功处理图像：{len(image_paths_batch)} 张")
     else:
         logging.info(f"{batch_prefix}：CLIP特征处理完成，有效图像 {len(image_paths_batch)} 张")
     
+    # 保存CLIP特征（如果需要）
     if args.save_clip_features:
-        # 保存CLIP特征（如果需要）
         clip_features_path = args.output.replace(".pt", f"_clip_features.pt") if args.output else os.path.join(
             os.path.dirname(args.image_path) if os.path.isfile(args.image_path) else args.image_path,
             "clip_features.pt"
         )
-        # 将特征移至CPU后保存，然后释放
-        clip_features_cpu = clip_features.cpu()
-        torch.save(clip_features_cpu, clip_features_path)
-        del clip_features_cpu
+        # CPU保存，节省显存
+        torch.save(clip_features.cpu(), clip_features_path)
         logging.info(f"{batch_prefix}：CLIP特征已保存到: {clip_features_path}")
-    del clip_features
+    
     # 释放CLIP特征以节省内存
+    del clip_features
     torch.cuda.empty_cache()
 
-    # 处理图像并转换为VAE可接受的输入格式 - 分批处理以减少内存占用
+    # 处理图像并转换为VAE可接受的输入格式 - 使用更小批次以减少内存占用
     try:
-        processed_images = []
-        image_dimensions = [] if args.verbose else None  # 只在详细模式下跟踪尺寸
-        sub_batch_size = min(10, len(image_paths_batch)) if args.memory_efficient else min(20, len(image_paths_batch))
-        process_pbar = tqdm(total=len(image_paths_batch), desc=f"{batch_prefix}：处理图像特征", disable=not args.verbose and args.no_progress)
-        # 创建进度条
-        for i in range(0, len(image_paths_batch), sub_batch_size):
-            sub_batch_paths = image_paths_batch[i:i + sub_batch_size]
-            sub_processed_images = []
-            # 子批次处理
-            for j, img_path in enumerate(sub_batch_paths):
-                try:
-                    # 加载并预处理图像
-                    img = Image.open(img_path).convert("RGB")
-                    if args.unified_size:
-                        # 检查图像大小，超过最大分辨率则自动缩小
-                        img = check_image_size(img, args.max_resolution)
-                        # 强制统一尺寸
-                        h, w = args.unified_size
-                        img_resized = img.resize((w, h), Image.Resampling.LANCZOS)
-                    elif input_size:
-                        # 使用输入尺寸
-                        h, w = input_size
-                        img_resized = img.resize((w, h), Image.Resampling.LANCZOS)
-                    else:
-                        # 原始尺寸
-                        h, w = img.height, img.width
-                        img_resized = img
-                    img_tensor = torch.from_numpy(np.array(img_resized)).permute(2, 0, 1).float() / 255.0
-                    img_tensor = img_tensor * 2 - 1
-                    img_tensor = img_tensor.unsqueeze(1)  # 添加时间维度 [C, T, H, W]
-                    sub_processed_images.append(img_tensor)
-                    # 只在详细模式下记录图像尺寸
-                    if args.verbose:
-                        final_size = (img_resized.height, img_resized.width)
-                        estimated_memory = img_resized.height * img_resized.width * 3 * 4 * 2  # 每像素3通道，float32，编解码阶段约2倍内存
-                        image_dimensions.append({
-                            'path': img_path,
-                            'original': (img.height, img.width),
-                            'resized': final_size,
-                            'estimated_memory_mb': estimated_memory / (1024 * 1024)
-                        })
-                except Exception as e:
-                    logging.error(f"处理图像 {img_path} 时出错: {e}")
-                    continue
-                img_idx = i + j
-                if args.verbose and img_idx > 0 and img_idx % args.log_interval == 0:
-                    logging.info(f"{batch_prefix}：已处理 {img_idx}/{len(image_paths_batch)} 张图像")
-                # 更新进度条
-                process_pbar.update(1)
-            # 将当前子批次的处理结果添加到主列表
-            processed_images.extend(sub_processed_images)    
-        process_pbar.close()
-        # 清理子批次变量
-        del sub_processed_images
-        if args.verbose and image_dimensions:        
-            largest_image = max(image_dimensions, key=lambda x: x['estimated_memory_mb'])
-            logging.info(f"{batch_prefix}：最大图像: {largest_image['path']} - 原始尺寸: {largest_image['original']}, 调整后: {largest_image['resized']}, 估计内存: {largest_image['estimated_memory_mb']:.2f}MB")
-        # 强制垃圾回收，确保释放所有未使用的内存
-        import gc
-        if args.memory_efficient or i % 100 == 0:
-            gc.collect()
-            torch.cuda.empty_cache()
-        # 关闭进度条
-        process_pbar.close()
-    except Exception as e:
-        logging.error(f"{batch_prefix}：处理特征时出错: {e}")
-        import traceback
-        logging.error(traceback.format_exc())
-        return None, None
+        # 减小子批量大小以降低内存使用
+        sub_batch_size = min(4, len(image_paths_batch)) if args.device.startswith('cuda') else min(8, len(image_paths_batch))
+        if args.memory_efficient:
+            sub_batch_size = max(1, sub_batch_size // 2)  # 更保守的设置
+            
+        # 使用生成器而非保存所有处理图像，逐批次处理
+        def image_batch_generator(paths, batch_size):
+            for i in range(0, len(paths), batch_size):
+                batch_paths = paths[i:i + batch_size]
+                batch_tensors = []
+                valid_indices = []
+                
+                for j, img_path in enumerate(batch_paths):
+                    try:
+                        # 加载并预处理图像
+                        img = Image.open(img_path).convert("RGB")
+                        if args.unified_size:
+                            img = check_image_size(img, args.max_resolution)
+                            h, w = args.unified_size
+                            img_resized = img.resize((w, h), Image.Resampling.LANCZOS)
+                        elif input_size:
+                            h, w = input_size
+                            img_resized = img.resize((w, h), Image.Resampling.LANCZOS)
+                        else:
+                            img_resized = check_image_size(img, args.max_resolution)
+                            
+                        # 转换为张量
+                        img_tensor = torch.from_numpy(np.array(img_resized)).permute(2, 0, 1).float() / 255.0
+                        img_tensor = img_tensor * 2 - 1
+                        img_tensor = img_tensor.unsqueeze(1)  # 添加时间维度 [C, T, H, W]
+                        batch_tensors.append(img_tensor)
+                        valid_indices.append(i + j)
+                        
+                        # 立即释放内存
+                        del img, img_resized
+                        
+                    except Exception as e:
+                        logging.error(f"处理图像 {img_path} 时出错: {e}")
+                        continue
+                
+                if batch_tensors:
+                    yield batch_tensors, valid_indices
+                    
+                # 每批次结束后清理内存
+                del batch_tensors
+                if args.device.startswith('cuda'):
+                    torch.cuda.empty_cache()
 
-    # 使用VAE编码特征
-    if args.verbose:
-        logging.info(f"{batch_prefix}：使用VAE编码特征...")
-    else:
-        logging.info(f"{batch_prefix}：开始VAE编码，共 {len(processed_images)} 张图像")
-    
-    try:
+        # 使用VAE编码特征 - 优化为流水线处理
+        if args.verbose:
+            logging.info(f"{batch_prefix}：使用VAE编码特征，采用流水线处理...")
+        else:
+            logging.info(f"{batch_prefix}：开始VAE编码，共 {len(image_paths_batch)} 张图像")
+        
         # 确定是否使用CPU进行VAE编码
         use_cpu = args.force_cpu_vae
         vae_device = torch.device('cpu') if use_cpu else args.device
         
-        # 保存原始VAE设备以便后续恢复
+        # 保存原始VAE设备
         if use_cpu:
             vae_original_device = vae.device
             vae.model = vae.model.to(torch.device('cpu'))
             vae.device = torch.device('cpu')
-            
-        if args.verbose and use_cpu:
-            logging.info("使用CPU处理VAE编码 (可能较慢但内存安全)")
-            
-        # 批量处理
-        if not args.no_progress:
-            pbar = tqdm(total=len(processed_images), desc=f"{batch_prefix}：VAE编码")
-        encoded_features = []
-        valid_indices = list(range(len(processed_images)))  # 记录成功处理的索引
         
-        # 分批进行VAE编码，每次编码完成后立即释放输入
-        for i, inp in enumerate(processed_images):
+        # 创建进度条
+        vae_pbar = tqdm(total=len(image_paths_batch), desc=f"{batch_prefix}：VAE编码", disable=args.no_progress)
+        
+        # 分批处理和编码
+        encoded_features = []
+        all_valid_indices = []
+        
+        for batch_tensors, valid_indices in image_batch_generator(image_paths_batch, sub_batch_size):
             try:
-                # 迁移到目标设备
-                inp_device = inp.to(vae_device)
-                
-                # 尝试编码
+                # 编码当前批次
                 with torch.no_grad():
-                    feat = vae.encode([inp_device])[0]
+                    # 将批次移动到设备
+                    device_tensors = [tensor.to(vae_device) for tensor in batch_tensors]
                     
-                    # 确保feat的z_dim为16，与Wan模型匹配
-                    if feat.shape[0] != args.z_dim:
-                        logging.warning(f"VAE编码特征通道数 {feat.shape[0]} 与预期的 {args.z_dim} 不匹配")
+                    # VAE编码
+                    batch_features = vae.encode(device_tensors)
                     
-                    # 始终调整潜在向量大小，确保输出一致性
-                    feat = F.interpolate(feat, size=args.unified_latent_size, 
-                                       mode='bilinear', align_corners=False)
+                    # 对每个特征调整大小
+                    for i, feat in enumerate(batch_features):
+                        # 调整潜在向量大小
+                        feat = F.interpolate(
+                            feat, 
+                            size=args.unified_latent_size, 
+                            mode='bilinear', 
+                            align_corners=False
+                        )
+                        
+                        # 移回CPU
+                        if not use_cpu:
+                            feat = feat.cpu()
+                        
+                        encoded_features.append(feat)
                 
-                # CPU特殊处理 - 保持在CPU上
-                if not use_cpu:
-                    feat = feat.cpu()  # 编码后立即移回CPU以释放GPU内存
+                # 记录有效索引
+                all_valid_indices.extend(valid_indices)
                 
-                encoded_features.append(feat)
+                # 更新进度条
+                vae_pbar.update(len(batch_tensors))
                 
-                # 释放当前输入张量
-                del inp_device
-                
-                # 每处理几张图像清理一次缓存
-                if not use_cpu and (i+1) % 5 == 0:
+                # 立即释放内存
+                del device_tensors, batch_features
+                if args.device.startswith('cuda'):
                     torch.cuda.empty_cache()
                     
-                # 周期性日志，避免过多输出
-                if args.verbose and i > 0 and i % args.log_interval == 0:
-                    logging.info(f"{batch_prefix}：已编码 {i}/{len(processed_images)} 张图像")
-                
             except torch.cuda.OutOfMemoryError:
-                # GPU内存不足，尝试在CPU上处理此图像
-                logging.warning(f"{batch_prefix}：GPU内存不足，尝试在CPU上处理图像 {i}")
+                # 如果GPU内存不足，尝试在CPU上处理
+                logging.warning(f"{batch_prefix}：GPU内存不足，尝试在CPU上处理批次")
                 try:
                     # 临时将VAE移至CPU
                     temp_vae_device = vae.device
                     vae.model = vae.model.to(torch.device('cpu'))
                     vae.device = torch.device('cpu')
                     
-                    # 在CPU上编码
-                    inp_cpu = inp.to(torch.device('cpu'))
                     with torch.no_grad():
-                        feat = vae.encode([inp_cpu])[0]
+                        # 在CPU上处理
+                        cpu_tensors = [tensor.to('cpu') for tensor in batch_tensors]
+                        batch_features = vae.encode(cpu_tensors)
                         
-                        # 始终调整潜在向量大小，确保输出一致性
-                        feat = F.interpolate(feat, size=args.unified_latent_size, 
-                                           mode='bilinear', align_corners=False)
-                    
-                    encoded_features.append(feat)
+                        # 调整大小并保存
+                        for i, feat in enumerate(batch_features):
+                            feat = F.interpolate(
+                                feat, 
+                                size=args.unified_latent_size, 
+                                mode='bilinear', 
+                                align_corners=False
+                            )
+                            encoded_features.append(feat)
                     
                     # 恢复VAE设备
                     vae.model = vae.model.to(temp_vae_device)
                     vae.device = temp_vae_device
                     
-                    del inp_cpu
+                    # 记录有效索引
+                    all_valid_indices.extend(valid_indices)
+                    
+                    # 更新进度条
+                    vae_pbar.update(len(batch_tensors))
+                    
+                    # 清理内存
+                    del cpu_tensors, batch_features
+                    gc.collect()
+                    
                 except Exception as e:
-                    logging.error(f"在CPU上处理图像 {i} 失败: {e}")
-                    valid_indices.remove(i)
-                    continue
+                    logging.error(f"{batch_prefix}：在CPU上处理批次时失败: {e}")
+                    # 继续处理下一批
+            
             except Exception as e:
-                logging.error(f"{batch_prefix}：处理图像 {i} 失败: {e}")
-                valid_indices.remove(i)
-                continue
-            
-            # 更新进度条
-            if not args.no_progress:
-                pbar.update(1)
+                logging.error(f"{batch_prefix}：处理VAE批次时出错: {e}")
+                # 继续处理下一批
         
-        # 关闭进度条
-        if not args.no_progress:
-            pbar.close()
-            
+        vae_pbar.close()
+        
         # 如果使用了CPU，将VAE模型恢复到原始设备
         if use_cpu:
             vae.model = vae.model.to(vae_original_device)
             vae.device = vae_original_device
         
-        # 释放原始图像数据
-        del processed_images
-        if not use_cpu:
-            torch.cuda.empty_cache()
+        # 如果没有成功处理任何图像，返回错误
+        if not encoded_features:
+            logging.error(f"{batch_prefix}：无法成功编码任何图像")
+            return None, None
         
-        # 确认所有特征尺寸一致并输出结果形状
-        if encoded_features and isinstance(encoded_features, list) and len(encoded_features) > 0:
+        # 获取有效路径
+        valid_paths = [image_paths_batch[i] for i in all_valid_indices]
+        
+        # 检查并确保所有特征形状一致
+        if len(encoded_features) > 1:
             expected_shape = (args.z_dim, 1, args.unified_latent_size[0], args.unified_latent_size[1])
-            all_same = all(feat.shape == expected_shape for feat in encoded_features)
-            if not all_same:
-                logging.warning("发现特征形状不一致，进行修正...")
-                corrected_features = []
-                for feat in encoded_features:
-                    # 调整空间维度
-                    if feat.shape[-2:] != (args.unified_latent_size[0], args.unified_latent_size[1]):
-                        feat = F.interpolate(feat, size=args.unified_latent_size, 
-                                            mode='bilinear', align_corners=False)
+            
+            # 验证并修复形状
+            for i in range(len(encoded_features)):
+                feat = encoded_features[i]
+                if feat.shape != expected_shape:
+                    # 修复形状
+                    if feat.shape[0] != expected_shape[0]:
+                        logging.warning(f"特征 {i} 的通道数不匹配，无法修复")
+                        continue
+                    
                     # 确保时间维度正确
                     if feat.shape[1] != 1:
                         feat = feat.mean(dim=1, keepdim=True)
-                    corrected_features.append(feat)
-                encoded_features = corrected_features
-                logging.info(f"所有特征已调整为统一形状: {expected_shape}")
+                    
+                    # 确保空间维度正确
+                    feat = F.interpolate(
+                        feat, 
+                        size=(args.unified_latent_size[0], args.unified_latent_size[1]),
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                    encoded_features[i] = feat
         
-        # 简化特征形状输出
-        if args.verbose:
-            if isinstance(encoded_features, list):
-                sample_shapes = [f.shape for f in encoded_features[:3]]
-                logging.info(f"{batch_prefix}：编码后的特征形状示例: {sample_shapes}{'...' if len(encoded_features) > 3 else ''}")
-            else:
-                logging.info(f"{batch_prefix}：编码后的特征形状: {encoded_features.shape}")
     except Exception as e:
-        logging.error(f"{batch_prefix}：编码特征时出错: {e}")
+        logging.error(f"{batch_prefix}：处理图像时出错: {e}")
         if args.verbose:
             import traceback
             logging.error(traceback.format_exc())
@@ -473,12 +541,6 @@ def process_image_batch(image_paths_batch, vae, clip_model, args, input_size=Non
     elapsed_time = time.time() - start_time
     logging.info(f"{batch_prefix}：处理完成，耗时: {elapsed_time:.2f} 秒")
     
-    # 确保有效路径与特征数量匹配
-    if len(valid_indices) < len(image_paths_batch):
-        valid_paths = [image_paths_batch[i] for i in valid_indices]
-    else:
-        valid_paths = image_paths_batch
-    
     return encoded_features, valid_paths
 
 def main():
@@ -486,6 +548,9 @@ def main():
     fix_amp_warnings()
     # 解析命令行参数
     args = parse_args()
+    
+    # 导入gc模块，确保在所有函数中都可访问
+    import gc
     
     # 配置日志级别 - 非verbose模式下减少输出
     log_level = logging.INFO if args.verbose else logging.WARNING
@@ -551,41 +616,48 @@ def main():
         num_batches = (len(image_paths) + args.images_per_file - 1) // args.images_per_file
         logging.info(f"图像数量 ({len(image_paths)}) 超过每批次最大数量 ({args.images_per_file})，将分为 {num_batches} 批处理")
     
+    # 构建输出文件名时避免重复计算
+    def get_output_path(args, batch_idx=0, need_split=False):
+        if args.output:
+            if need_split:
+                output_base = os.path.splitext(args.output)[0]
+                output_ext = os.path.splitext(args.output)[1]
+                return f"{output_base}_batch{batch_idx + 1}{output_ext}"
+            else:
+                return args.output
+        else:
+            if os.path.isdir(args.image_path):
+                dir_name = os.path.basename(os.path.normpath(args.image_path))
+                output_dir = args.image_path
+                if need_split:
+                    return os.path.join(output_dir, f"{dir_name}_vae_encoded_batch{batch_idx + 1}.pt")
+                else:
+                    return os.path.join(output_dir, f"{dir_name}_vae_encoded.pt")
+            else:
+                output_dir = os.path.dirname(args.image_path)
+                base_filename = os.path.basename(args.image_path).split('.')[0]
+                if need_split:
+                    return os.path.join(output_dir, f"{base_filename}_vae_encoded_batch{batch_idx + 1}.pt")
+                else:
+                    return os.path.join(output_dir, f"{base_filename}_vae_encoded.pt")
+    
+    # 解析输入尺寸
+    input_size = None
+    if args.input_size:
+        try:
+            h, w = map(int, args.input_size.split(','))
+            input_size = (w, h)  # PIL使用(width, height)格式
+        except:
+            logging.warning(f"无效的输入尺寸格式: {args.input_size}, 将使用原始尺寸")
+    
     # 处理每一批图像
     for batch_idx in range(num_batches) if need_split else [0]:
         start_idx = batch_idx * args.images_per_file if need_split else 0
         end_idx = min(start_idx + args.images_per_file, len(image_paths)) if need_split else len(image_paths)
         batch_paths = image_paths[start_idx:end_idx]
         
-        # 构建智能化输出文件名，保留原文件名或目录名信息
-        if args.output:
-            # 如果用户指定了输出路径
-            if need_split:
-                output_base = os.path.splitext(args.output)[0]
-                output_ext = os.path.splitext(args.output)[1]
-                batch_output = f"{output_base}_batch{batch_idx + 1}{output_ext}"
-            else:
-                batch_output = args.output
-        else:
-            # 如果没有指定输出路径，使用输入路径的名称部分
-            if os.path.isdir(args.image_path):
-                # 目录输入 - 使用目录名作为基础
-                dir_name = os.path.basename(os.path.normpath(args.image_path))
-                output_dir = args.image_path
-                if need_split:
-                    output_filename = f"{dir_name}_vae_encoded_batch{batch_idx + 1}.pt"
-                else:
-                    output_filename = f"{dir_name}_vae_encoded.pt"
-            else:
-                # 单文件输入 - 使用文件名作为基础
-                output_dir = os.path.dirname(args.image_path)
-                base_filename = os.path.basename(args.image_path).split('.')[0]
-                if need_split:
-                    output_filename = f"{base_filename}_vae_encoded_batch{batch_idx + 1}.pt"
-                else:
-                    output_filename = f"{base_filename}_vae_encoded.pt"
-            
-            batch_output = os.path.join(output_dir, output_filename)
+        # 使用函数获取输出路径
+        batch_output = get_output_path(args, batch_idx, need_split)
         
         # 准备元数据
         metadata = {
@@ -599,18 +671,9 @@ def main():
             "unified_latent_size": str(args.unified_latent_size),
             "batch_info": f"Batch {batch_idx + 1}/{num_batches}" if need_split else "全量处理",
             "format_description": f"VAE编码后的潜在向量，形状固定为 [{args.z_dim}, 1, {args.unified_latent_size[0]}, {args.unified_latent_size[1]}]",
-            "source": args.image_path,  # 添加源路径信息
-            "file_count": len(batch_paths)  # 添加文件数量信息
+            "source": args.image_path,
+            "file_count": len(batch_paths)
         }
-        
-        # 解析输入尺寸
-        input_size = None
-        if args.input_size:
-            try:
-                h, w = map(int, args.input_size.split(','))
-                input_size = (w, h)  # PIL使用(width, height)格式
-            except:
-                logging.warning(f"无效的输入尺寸格式: {args.input_size}, 将使用原始尺寸")
 
         # 处理一批图像
         encoded_features, valid_paths = process_image_batch(batch_paths, vae, clip_model, args, input_size, batch_idx + 1)
@@ -618,52 +681,139 @@ def main():
             logging.error(f"批次 {batch_idx + 1} 处理失败，跳过")
             # 强制清理内存
             torch.cuda.empty_cache()
+            gc.collect()
             continue
-            
-        # 保存编码后的特征（确保移至CPU再保存）
+        
+        # 改进的保存逻辑，使用多种策略防止文件损坏
         try:
-            # 如果是列表，确保所有张量都在CPU上
-            if isinstance(encoded_features, list):
-                if len(encoded_features) == 1:
-                    save_features = encoded_features[0].cpu()
-                else:
-                    # 将特征列表转换为完整的张量
-                    # 这样.pt文件转为文本后不会显示省略号
-                    try:
-                        save_features = torch.stack([feat.cpu() for feat in encoded_features])
-                    except:
-                        # 如果无法堆叠(可能形状不一)，保留列表形式
-                        logging.warning("无法将所有特征堆叠为单一张量，保留列表格式")
-                        save_features = [feat.cpu() for feat in encoded_features]
+            # 分块保存大型特征
+            if isinstance(encoded_features, list) and len(encoded_features) > 100:
+                logging.info(f"特征数量较多 ({len(encoded_features)}), 采用分块保存策略")
+                
+                # 准备保存数据
+                features_data = None
+                
+                # 先尝试堆叠成单一张量
+                try:
+                    # 确保所有特征形状一致
+                    expected_shape = encoded_features[0].shape
+                    if not all(feat.shape == expected_shape for feat in encoded_features):
+                        logging.warning("特征形状不一致，无法堆叠为单一张量")
+                        raise ValueError("特征形状不一致")
+                    
+                    # 尝试将所有特征堆叠为单一张量
+                    features_tensor = torch.stack([feat.cpu() for feat in encoded_features])
+                    
+                    # 保存完整数据
+                    complete_data = {
+                        'features': features_tensor,
+                        'image_paths': valid_paths,
+                        'metadata': metadata
+                    }
+                    
+                    # 安全保存文件
+                    save_success = safe_save_pt(complete_data, batch_output)
+                    if not save_success:
+                        raise ValueError("保存单一张量失败，尝试分块保存")
+                        
+                    # 释放内存
+                    del features_tensor, complete_data
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    
+                except Exception as stack_err:
+                    logging.warning(f"堆叠特征失败: {stack_err}，尝试分块保存")
+                    
+                    # 元数据和路径
+                    metadata_data = {
+                        'metadata': metadata,
+                        'image_paths': valid_paths
+                    }
+                    
+                    # 使用临时文件
+                    temp_file = batch_output + ".tmp"
+                    torch.save(metadata_data, temp_file)
+                    
+                    # 分块保存特征
+                    chunk_size = 20  # 更小的块大小，降低内存需求
+                    num_chunks = (len(encoded_features) + chunk_size - 1) // chunk_size
+                    
+                    logging.info(f"开始分块保存，共 {num_chunks} 个块")
+                    
+                    # 分块保存，每个块单独保存
+                    for chunk_idx in range(num_chunks):
+                        start_idx = chunk_idx * chunk_size
+                        end_idx = min((chunk_idx + 1) * chunk_size, len(encoded_features))
+                        
+                        # 当前块的特征
+                        chunk_features = encoded_features[start_idx:end_idx]
+                        chunk_data = {
+                            'features_chunk': [feat.cpu() for feat in chunk_features],
+                            'chunk_idx': chunk_idx,
+                            'chunk_start': start_idx,
+                            'chunk_end': end_idx,
+                            'total_chunks': num_chunks
+                        }
+                        
+                        # 保存当前块
+                        chunk_file = f"{batch_output}.chunk{chunk_idx}"
+                        torch.save(chunk_data, chunk_file)
+                        
+                        # 释放内存
+                        del chunk_features, chunk_data
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        
+                        logging.info(f"保存块 {chunk_idx+1}/{num_chunks}")
+                    
+                    # 创建索引文件
+                    index_data = {
+                        'metadata': metadata,
+                        'image_paths': valid_paths,
+                        'is_chunked': True,
+                        'total_chunks': num_chunks,
+                        'chunk_prefix': batch_output,
+                        'features_count': len(encoded_features)
+                    }
+                    
+                    # 保存索引文件
+                    if safe_save_pt(index_data, batch_output):
+                        logging.info(f"分块保存成功，索引文件: {batch_output}, 块数: {num_chunks}")
+                    else:
+                        raise ValueError("保存索引文件失败")
+                        
+                    # 清理临时文件
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
             else:
-                save_features = encoded_features.cpu()
-                
-            # 完全释放GPU上的特征
-            del encoded_features
-            torch.cuda.empty_cache()
-            
-            # 保存数据
-            save_data = {
-                'features': save_features,
-                'image_paths': valid_paths,
-                'metadata': metadata 
-            }
-            
-            # 打印样本特征形状信息，不含省略号
-            if args.verbose:
-                if isinstance(save_features, list):
-                    shape_info = f"特征列表: {len(save_features)}项，样本形状: {save_features[0].shape}"
+                # 常规保存方式 - 适用于少量特征
+                if isinstance(encoded_features, list):
+                    if len(encoded_features) == 1:
+                        save_features = encoded_features[0].cpu()
+                    else:
+                        try:
+                            save_features = torch.stack([feat.cpu() for feat in encoded_features])
+                        except Exception as e:
+                            logging.warning(f"无法堆叠特征: {e}，保留列表格式")
+                            save_features = [feat.cpu() for feat in encoded_features]
                 else:
-                    shape_info = f"特征张量形状: {save_features.shape}"
-                logging.info(f"保存的特征信息 - {shape_info}")
+                    save_features = encoded_features.cpu()
                 
-            # 保存特征和元数据
-            torch.save(save_data, batch_output)
-            logging.info(f"VAE编码特征已保存到: {batch_output}")
+                # 保存完整数据
+                save_data = {
+                    'features': save_features,
+                    'image_paths': valid_paths,
+                    'metadata': metadata 
+                }
+                
+                # 安全保存文件
+                if safe_save_pt(save_data, batch_output):
+                    logging.info(f"VAE编码特征已保存到: {batch_output}")
+                else:
+                    raise ValueError("保存文件失败")
             
             # 释放内存
-            del save_features, save_data
-            import gc
+            del encoded_features, valid_paths
             gc.collect()
             torch.cuda.empty_cache()
             
@@ -671,7 +821,26 @@ def main():
             logging.error(f"保存批次 {batch_idx + 1} 编码特征时出错: {e}")
             import traceback
             logging.error(traceback.format_exc())
-            return
+            
+            # 紧急备份保存 - 尝试最简化的保存方式
+            try:
+                emergency_output = f"{batch_output}.emergency.pt"
+                logging.info(f"尝试紧急备份保存到: {emergency_output}")
+                
+                # 尽可能简化数据
+                if isinstance(encoded_features, list):
+                    simple_features = [f.cpu().detach() for f in encoded_features]
+                else:
+                    simple_features = encoded_features.cpu().detach()
+                
+                # 使用最简单的方式保存
+                simple_data = {'features': simple_features, 'paths': valid_paths}
+                torch.save(simple_data, emergency_output)
+                logging.info(f"紧急备份保存成功: {emergency_output}")
+            except Exception as backup_err:
+                logging.error(f"紧急备份保存也失败: {backup_err}")
+            
+            continue  # 继续处理下一批
     
     # 在脚本结束时添加明确的输出格式说明
     logging.info("\n输出数据格式说明：")
@@ -685,5 +854,58 @@ def main():
     logging.info("====================\n")
     logging.info("提示: 保存的.pt文件包含完整张量数据，如需查看数值请使用torch.load()加载")
 
+# 新增一个读取功能，同时支持常规和分块保存格式
+def load_vae_features(file_path):
+    """加载VAE特征，支持常规和分块保存格式"""
+    try:
+        # 加载文件
+        data = torch.load(file_path, map_location='cpu')
+        
+        # 检查是否为分块格式
+        if 'is_chunked' in data and data['is_chunked']:
+            logging.info(f"检测到分块格式，共 {data['total_chunks']} 块")
+            
+            # 存储所有特征
+            all_features = [None] * data['features_count']
+            paths = data['image_paths']
+            metadata = data['metadata']
+            
+            # 加载所有块
+            chunk_prefix = data['chunk_prefix']
+            for i in range(data['total_chunks']):
+                chunk_file = f"{chunk_prefix}.chunk{i}"
+                if not os.path.exists(chunk_file):
+                    logging.error(f"块文件不存在: {chunk_file}")
+                    continue
+                
+                # 加载当前块
+                chunk_data = torch.load(chunk_file, map_location='cpu')
+                chunk_features = chunk_data['features_chunk']
+                start_idx = chunk_data['chunk_start']
+                
+                # 填充特征数组
+                for j, feat in enumerate(chunk_features):
+                    all_features[start_idx + j] = feat
+            
+            # 检查是否所有特征都已加载
+            if None in all_features:
+                missing = all_features.count(None)
+                logging.warning(f"有 {missing}/{len(all_features)} 个特征缺失")
+                # 去除缺失的特征
+                all_features = [f for f in all_features if f is not None]
+            
+            # 返回加载的数据
+            return {'features': all_features, 'image_paths': paths, 'metadata': metadata}
+        else:
+            # 常规格式，直接返回
+            return data
+            
+    except Exception as e:
+        logging.error(f"加载特征文件失败: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
+        return None
+
+# 对主脚本添加一个新参数，用于测试加载保存的文件
 if __name__ == "__main__":
     main()

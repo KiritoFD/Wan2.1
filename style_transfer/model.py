@@ -33,44 +33,92 @@ class StyleDataset(Dataset):
         squeeze_time (bool): 是否去除时间维度(通常为1)
     """
     def __init__(self, data_path, squeeze_time=True):
-        data = torch.load(data_path)
         self.path = data_path
         
-        # 处理features，根据不同的格式进行适配
-        if 'features' in data:
-            features = data['features']
+        try:
+            # 尝试加载文件的不同方式
+            try:
+                # 主要加载方式
+                logging.info(f"尝试加载数据: {data_path}")
+                data = torch.load(data_path)
+                logging.info(f"数据加载成功，文件大小: {os.path.getsize(data_path) / (1024*1024):.2f}MB")
+            except Exception as e:
+                # 如果主要方式失败，尝试备用加载方式
+                logging.warning(f"常规加载失败，尝试使用备用方式: {str(e)}")
+                
+                # 使用map_location确保加载到CPU，避免CUDA内存问题
+                data = torch.load(data_path, map_location='cpu')
             
-            # 如果features是单个张量
-            if isinstance(features, torch.Tensor):
-                if features.dim() == 4:  # [16, 1, 32, 32]
-                    # 添加批次维度
-                    self.features = features.unsqueeze(0)
+            # 处理features，根据不同的格式进行适配
+            if 'features' in data:
+                features = data['features']
+                
+                # 如果features是单个张量
+                if isinstance(features, torch.Tensor):
+                    if features.dim() == 4:  # [16, 1, 32, 32]
+                        # 添加批次维度
+                        self.features = features.unsqueeze(0)
+                    else:
+                        # 假设已有批次维度 [N, 16, 1, 32, 32]
+                        self.features = features
+                # 如果features是张量列表
+                elif isinstance(features, list):
+                    # 堆叠为单个张量
+                    logging.info(f"发现特征列表，包含 {len(features)} 个张量")
+                    try:
+                        self.features = torch.stack(features)
+                    except Exception as stack_err:
+                        # 如果无法直接堆叠，检查维度不一致问题
+                        logging.warning(f"无法直接堆叠特征: {stack_err}")
+                        
+                        # 转换为统一大小
+                        if len(features) > 0:
+                            sample = features[0]
+                            expected_shape = list(sample.shape)
+                            consistent_features = []
+                            
+                            for i, feat in enumerate(features):
+                                if feat.shape == sample.shape:
+                                    consistent_features.append(feat)
+                                else:
+                                    logging.warning(f"跳过形状不一致的特征 {i}: {feat.shape} != {expected_shape}")
+                            
+                            if consistent_features:
+                                self.features = torch.stack(consistent_features)
+                                logging.info(f"成功堆叠 {len(consistent_features)}/{len(features)} 个形状一致的特征")
+                            else:
+                                raise ValueError(f"无法找到形状一致的特征进行堆叠")
+                        else:
+                            raise ValueError("特征列表为空")
                 else:
-                    # 假设已有批次维度 [N, 16, 1, 32, 32]
-                    self.features = features
-            # 如果features是张量列表
-            elif isinstance(features, list):
-                # 堆叠为单个张量
-                self.features = torch.stack(features)
+                    raise ValueError(f"不支持的features类型: {type(features)}")
             else:
-                raise ValueError(f"不支持的features类型: {type(features)}")
-        else:
-            raise ValueError(f"数据中找不到'features'键")
-        
-        # 记录原始形状
-        self.original_shape = self.features.shape
-        
-        # 可选去除时间维度（通常为1）
-        if squeeze_time and self.features.shape[2] == 1:
-            self.features = self.features.squeeze(2)
-        
-        # 获取图像路径和元数据，如果有
-        self.image_paths = data.get('image_paths', None)
-        self.metadata = data.get('metadata', None)
-        
-        logging.info(f"加载数据集: {data_path}")
-        logging.info(f"  - 特征形状: {self.features.shape}")
-        logging.info(f"  - 样本数量: {len(self.features)}")
+                # 尝试检查文件包含的内容
+                keys = list(data.keys()) if isinstance(data, dict) else []
+                raise ValueError(f"数据中找不到'features'键，可用键: {keys}")
+            
+            # 记录原始形状
+            self.original_shape = self.features.shape
+            logging.info(f"加载的特征形状: {self.original_shape}")
+            
+            # 可选去除时间维度（通常为1）
+            if squeeze_time and self.features.shape[2] == 1:
+                self.features = self.features.squeeze(2)
+                logging.info(f"去除时间维度后的形状: {self.features.shape}")
+            
+            # 获取图像路径和元数据，如果有
+            self.image_paths = data.get('image_paths', None)
+            self.metadata = data.get('metadata', None)
+            
+            logging.info(f"数据集加载完成: {data_path}")
+            logging.info(f"  - 特征形状: {self.features.shape}")
+            logging.info(f"  - 样本数量: {len(self.features)}")
+            
+        except Exception as e:
+            logging.error(f"加载数据集 {data_path} 时出错: {e}")
+            import traceback
+            logging.error(traceback.format_exc())
+            raise
 
     def __len__(self):
         return len(self.features)
@@ -203,7 +251,7 @@ class StyleTransferAAE:
     
     使用对抗性自编码器学习两种不同风格之间的映射
     """
-    def __init__(self, device='cuda', latent_dim=128):
+    def __init__(self, device='cuda', latent_dim=256):  # 增大默认潜在空间维度
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.latent_dim = latent_dim
         
@@ -211,15 +259,24 @@ class StyleTransferAAE:
         self.encoder = None
         self.decoder = None
         self.discriminator = None
+        self.style_mapper = None  # 新增风格映射网络
         
         # 优化器
         self.optimizer_E = None
         self.optimizer_D = None
         self.optimizer_Dis = None
+        self.optimizer_Map = None  # 新增映射网络的优化器
         
         # 损失函数
         self.reconstruction_loss = nn.MSELoss()
-        self.adversarial_loss = nn.BCELoss()
+        self.content_loss = nn.L1Loss()  # 内容损失
+        self.style_loss = nn.MSELoss()   # 风格损失
+        self.adversarial_loss = nn.BCEWithLogitsLoss()  # 带logits的BCE，更稳定
+        
+        # 训练参数
+        self.lambda_recon = 10.0     # 重建损失权重
+        self.lambda_content = 5.0    # 内容损失权重
+        self.lambda_adv = 1.0        # 对抗损失权重
         
         # 训练状态
         self.is_trained = False
@@ -233,16 +290,48 @@ class StyleTransferAAE:
 
     def build_models(self, in_channels=16):
         """构建所有模型组件"""
-        self.encoder = Encoder(in_channels=in_channels, latent_dim=self.latent_dim).to(self.device)
-        self.decoder = Decoder(out_channels=in_channels, latent_dim=self.latent_dim).to(self.device)
-        self.discriminator = Discriminator(latent_dim=self.latent_dim).to(self.device)
+        # 构建更强大的编码器
+        self.encoder = EnhancedEncoder(
+            in_channels=in_channels, 
+            latent_dim=self.latent_dim,
+            use_attention=True  # 使用注意力机制
+        ).to(self.device)
         
-        # 初始化优化器
-        self.optimizer_E = optim.Adam(self.encoder.parameters(), lr=0.0002, betas=(0.5, 0.999))
-        self.optimizer_D = optim.Adam(self.decoder.parameters(), lr=0.0002, betas=(0.5, 0.999))
-        self.optimizer_Dis = optim.Adam(self.discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
+        # 构建更强大的解码器
+        self.decoder = EnhancedDecoder(
+            out_channels=in_channels, 
+            latent_dim=self.latent_dim,
+            use_residual=True  # 使用残差连接
+        ).to(self.device)
         
-        logging.info(f"构建模型完成, 输入通道数: {in_channels}")
+        # 风格映射网络 - 在潜在空间中学习风格映射
+        self.style_mapper = StyleMapper(
+            latent_dim=self.latent_dim,
+            depth=4  # 增加深度
+        ).to(self.device)
+        
+        # 增强的判别器
+        self.discriminator = EnhancedDiscriminator(
+            latent_dim=self.latent_dim,
+            use_spectral_norm=True  # 使用谱归一化
+        ).to(self.device)
+        
+        # 优化器使用更优的配置
+        lr = 3e-4  # 使用稍低的学习率，提高稳定性
+        beta1, beta2 = 0.5, 0.999  # 标准GAN的beta参数
+        
+        self.optimizer_E = optim.AdamW(self.encoder.parameters(), lr=lr, betas=(beta1, beta2), weight_decay=1e-4)
+        self.optimizer_D = optim.AdamW(self.decoder.parameters(), lr=lr, betas=(beta1, beta2), weight_decay=1e-4)
+        self.optimizer_Map = optim.AdamW(self.style_mapper.parameters(), lr=lr, betas=(beta1, beta2), weight_decay=1e-4)
+        self.optimizer_Dis = optim.AdamW(self.discriminator.parameters(), lr=lr, betas=(beta1, beta2), weight_decay=1e-4)
+        
+        # 使用学习率调度器
+        self.scheduler_E = optim.lr_scheduler.CosineAnnealingLR(self.optimizer_E, T_max=50)
+        self.scheduler_D = optim.lr_scheduler.CosineAnnealingLR(self.optimizer_D, T_max=50)
+        self.scheduler_Map = optim.lr_scheduler.CosineAnnealingLR(self.optimizer_Map, T_max=50)
+        self.scheduler_Dis = optim.lr_scheduler.CosineAnnealingLR(self.optimizer_Dis, T_max=50)
+        
+        logging.info(f"构建增强模型完成, 输入通道数: {in_channels}, 潜在空间维度: {self.latent_dim}")
 
     def train(self, dataloader_a, dataloader_b, num_epochs=100, save_dir=None):
         """
@@ -292,68 +381,111 @@ class StyleTransferAAE:
                 batch_size = real_a.size(0)
                 
                 # ---------------------
-                # 训练自编码器（重建损失）
+                # 1. 训练自编码器 - 重建和内容损失
                 # ---------------------
                 self.optimizer_E.zero_grad()
                 self.optimizer_D.zero_grad()
+                self.optimizer_Map.zero_grad()
 
-                # 编码和解码
+                # 编码
                 latent_a = self.encoder(real_a)
-                reconstructed_a = self.decoder(latent_a)
-                loss_reconstruction = self.reconstruction_loss(reconstructed_a, real_a)
-
+                latent_b = self.encoder(real_b)
+                
+                # 风格映射
+                mapped_latent_a = self.style_mapper(latent_a)  # A->B
+                
+                # 解码
+                recon_a = self.decoder(latent_a)       # A->A
+                recon_b = self.decoder(latent_b)       # B->B
+                fake_b = self.decoder(mapped_latent_a)  # A->B
+                
+                # 重建损失
+                loss_recon_a = self.reconstruction_loss(recon_a, real_a)
+                loss_recon_b = self.reconstruction_loss(recon_b, real_b)
+                loss_recon = loss_recon_a + loss_recon_b
+                
+                # 重新编码生成的B风格特征，计算循环一致性损失
+                latent_fake_b = self.encoder(fake_b)
+                loss_content = self.content_loss(latent_fake_b, mapped_latent_a)
+                
+                # 总重建损失
+                total_recon_loss = self.lambda_recon * loss_recon + self.lambda_content * loss_content
+                
                 # 反向传播
-                loss_reconstruction.backward()
+                total_recon_loss.backward()
                 self.optimizer_E.step()
                 self.optimizer_D.step()
+                self.optimizer_Map.step()
                 
                 # ---------------------
-                # 训练判别器
+                # 2. 训练判别器
                 # ---------------------
                 self.optimizer_Dis.zero_grad()
 
-                # 真实分布（来自风格B的潜在空间）
-                latent_b = self.encoder(real_b).detach()
-                real_labels = torch.ones(batch_size, 1).to(self.device)
-                fake_labels = torch.zeros(batch_size, 1).to(self.device)
-
-                # 判别真实分布
-                pred_real = self.discriminator(latent_b)
-                loss_real = self.adversarial_loss(pred_real, real_labels)
-
-                # 判别生成分布
-                pred_fake = self.discriminator(latent_a.detach())
-                loss_fake = self.adversarial_loss(pred_fake, fake_labels)
-
-                # 总判别器损失
-                loss_discriminator = (loss_real + loss_fake) / 2
+                # 获取真假样本
+                latent_b_real = self.encoder(real_b).detach()
+                fake_latent_b = self.style_mapper(latent_a.detach())
+                
+                # 真样本的判别
+                pred_real = self.discriminator(latent_b_real)
+                # 假样本的判别
+                pred_fake = self.discriminator(fake_latent_b.detach())
+                
+                # 使用hinge loss或WGAN-GP损失可以提高稳定性
+                loss_d_real = torch.mean(F.relu(1.0 - pred_real))
+                loss_d_fake = torch.mean(F.relu(1.0 + pred_fake))
+                loss_discriminator = loss_d_real + loss_d_fake
+                
+                # 反向传播
                 loss_discriminator.backward()
                 self.optimizer_Dis.step()
 
                 # ---------------------
-                # 训练生成器（欺骗判别器）
+                # 3. 训练生成器 - 对抗损失和风格损失
                 # ---------------------
                 self.optimizer_E.zero_grad()
+                self.optimizer_Map.zero_grad()
 
-                # 让生成的潜在空间被误认为是真实的
-                pred_fake = self.discriminator(latent_a)
-                loss_generator = self.adversarial_loss(pred_fake, real_labels)
-
+                # 重新计算映射的潜在向量
+                latent_a_gen = self.encoder(real_a)
+                mapped_latent_a_gen = self.style_mapper(latent_a_gen)
+                
+                # 判别器对生成的风格B的预测
+                pred_gen = self.discriminator(mapped_latent_a_gen)
+                
+                # 生成器对抗损失 - 欺骗判别器
+                loss_generator = -torch.mean(pred_gen)  # WGAN风格的损失
+                
+                # 风格损失 - 让生成的特征与目标风格匹配
+                target_style_stats = calc_style_statistics(latent_b)
+                gen_style_stats = calc_style_statistics(mapped_latent_a_gen)
+                loss_style = style_distance(gen_style_stats, target_style_stats)
+                
+                # 总生成器损失
+                total_gen_loss = self.lambda_adv * loss_generator + loss_style
+                
                 # 反向传播
-                loss_generator.backward()
+                total_gen_loss.backward()
                 self.optimizer_E.step()
+                self.optimizer_Map.step()
                 
                 # 累积损失
-                epoch_recon_loss += loss_reconstruction.item()
+                epoch_recon_loss += total_recon_loss.item()
                 epoch_disc_loss += loss_discriminator.item()
-                epoch_gen_loss += loss_generator.item()
+                epoch_gen_loss += total_gen_loss.item()
                 
                 # 更新进度条
                 pbar.set_postfix({
-                    'recon': loss_reconstruction.item(),
+                    'recon': total_recon_loss.item(),
                     'disc': loss_discriminator.item(), 
-                    'gen': loss_generator.item()
+                    'gen': total_gen_loss.item()
                 })
+            
+            # 更新学习率
+            self.scheduler_E.step()
+            self.scheduler_D.step()
+            self.scheduler_Map.step()
+            self.scheduler_Dis.step()
             
             # 计算平均损失
             avg_recon_loss = epoch_recon_loss / steps_per_epoch
@@ -386,12 +518,13 @@ class StyleTransferAAE:
             
         return self.training_history
 
-    def transfer_style(self, input_tensor):
+    def transfer_style(self, input_tensor, add_time_dim=False):
         """
         将输入张量从风格A转换为风格B
         
         Args:
             input_tensor: 输入张量，形状为 [N, 16, 32, 32] 或 [16, 32, 32]
+            add_time_dim: 是否在输出中添加时间维度
             
         Returns:
             风格转换后的张量
@@ -410,8 +543,13 @@ class StyleTransferAAE:
         with torch.no_grad():
             input_tensor = input_tensor.to(self.device)
             latent = self.encoder(input_tensor)
-            output = self.decoder(latent)
+            mapped_latent = self.style_mapper(latent)  # 风格映射
+            output = self.decoder(mapped_latent)
             
+            # 如果需要添加时间维度
+            if add_time_dim:
+                output = output.unsqueeze(2)  # [N, C, H, W] -> [N, C, 1, H, W]
+                
         return output.cpu()
 
     def save_model(self, save_dir):
@@ -507,3 +645,293 @@ class StyleTransferAAE:
             plt.close()
         else:
             plt.show()
+
+
+# 新增更强大的编码器
+class EnhancedEncoder(nn.Module):
+    def __init__(self, in_channels=16, latent_dim=256, use_attention=True):
+        super(EnhancedEncoder, self).__init__()
+        
+        # 激活函数
+        self.act = nn.LeakyReLU(0.2, inplace=True)
+        
+        # 初始卷积
+        self.conv_in = nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1)
+        self.norm_in = nn.InstanceNorm2d(64)
+        
+        # 下采样块
+        self.down1 = ResidualDownBlock(64, 128)  # 32x32 -> 16x16
+        self.down2 = ResidualDownBlock(128, 256)  # 16x16 -> 8x8
+        self.down3 = ResidualDownBlock(256, 512)  # 8x8 -> 4x4
+        
+        # 注意力机制
+        self.use_attention = use_attention
+        if use_attention:
+            self.attention = SelfAttention(512)
+        
+        # 全局平均池化
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        
+        # 映射到潜在空间
+        self.fc = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, latent_dim)
+        )
+
+    def forward(self, x):
+        # 初始处理
+        x = self.act(self.norm_in(self.conv_in(x)))
+        
+        # 下采样
+        x = self.down1(x)
+        x = self.down2(x)
+        x = self.down3(x)
+        
+        # 注意力
+        if self.use_attention:
+            x = self.attention(x)
+        
+        # 全局池化和映射
+        x = self.gap(x).flatten(1)
+        x = self.fc(x)
+        
+        return x
+
+
+# 新增更强大的解码器
+class EnhancedDecoder(nn.Module):
+    def __init__(self, out_channels=16, latent_dim=256, use_residual=True):
+        super(EnhancedDecoder, self).__init__()
+        
+        # 潜在空间 -> 4x4 特征图
+        self.fc = nn.Linear(latent_dim, 512 * 4 * 4)
+        self.norm_fc = nn.BatchNorm2d(512)
+        
+        # 上采样块
+        self.up1 = ResidualUpBlock(512, 256)  # 4x4 -> 8x8
+        self.up2 = ResidualUpBlock(256, 128)  # 8x8 -> 16x16
+        self.up3 = ResidualUpBlock(128, 64)   # 16x16 -> 32x32
+        
+        # AdaIN自适应实例归一化
+        self.use_residual = use_residual
+        if use_residual:
+            self.res1 = AdaINResBlock(256)
+            self.res2 = AdaINResBlock(128)
+            self.res3 = AdaINResBlock(64)
+        
+        # 输出层
+        self.conv_out = nn.Conv2d(64, out_channels, kernel_size=3, stride=1, padding=1)
+        
+    def forward(self, x):
+        # 从潜在空间重建特征图
+        x = self.fc(x).view(-1, 512, 4, 4)
+        x = F.relu(self.norm_fc(x))
+        
+        # 上采样
+        x = self.up1(x)
+        if self.use_residual:
+            x = self.res1(x)
+            
+        x = self.up2(x)
+        if self.use_residual:
+            x = self.res2(x)
+            
+        x = self.up3(x)
+        if self.use_residual:
+            x = self.res3(x)
+        
+        # 输出
+        x = self.conv_out(x)
+        
+        return x
+
+
+# 风格映射网络 - MLP形式
+class StyleMapper(nn.Module):
+    def __init__(self, latent_dim=256, depth=4, width_factor=2):
+        super(StyleMapper, self).__init__()
+        
+        hidden_dim = latent_dim * width_factor
+        
+        layers = []
+        layers.append(nn.Linear(latent_dim, hidden_dim))
+        layers.append(nn.LeakyReLU(0.2, inplace=True))
+        
+        # 中间层
+        for _ in range(depth - 2):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+        
+        # 输出层
+        layers.append(nn.Linear(hidden_dim, latent_dim))
+        
+        self.mapping = nn.Sequential(*layers)
+        
+    def forward(self, x):
+        return self.mapping(x)
+
+
+# 增强的判别器
+class EnhancedDiscriminator(nn.Module):
+    def __init__(self, latent_dim=256, use_spectral_norm=True):
+        super(EnhancedDiscriminator, self).__init__()
+        
+        def get_norm_layer(dim):
+            if use_spectral_norm:
+                return nn.utils.spectral_norm(nn.Linear(dim, dim))
+            else:
+                return nn.Identity()
+        
+        # 更深的判别器网络
+        self.model = nn.Sequential(
+            nn.Linear(latent_dim, 512),
+            get_norm_layer(512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.3),
+            
+            nn.Linear(512, 512),
+            get_norm_layer(512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.3),
+            
+            nn.Linear(512, 256),
+            get_norm_layer(256),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            nn.Linear(256, 1)  # 输出原始logits，不用sigmoid
+        )
+        
+    def forward(self, x):
+        return self.model(x)
+
+
+# 残差下采样块
+class ResidualDownBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(ResidualDownBlock, self).__init__()
+        
+        # 主分支
+        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
+        self.norm1 = nn.InstanceNorm2d(in_channels)
+        self.conv2 = nn.Conv2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1)
+        self.norm2 = nn.InstanceNorm2d(out_channels)
+        
+        # 残差分支
+        self.shortcut = nn.Sequential(
+            nn.AvgPool2d(2),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+        )
+        
+    def forward(self, x):
+        residual = x
+        
+        # 主分支
+        out = F.leaky_relu(self.norm1(self.conv1(x)), 0.2)
+        out = F.leaky_relu(self.norm2(self.conv2(out)), 0.2)
+        
+        # 残差连接
+        out = out + self.shortcut(residual)
+        
+        return out
+
+
+# 残差上采样块
+class ResidualUpBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(ResidualUpBlock, self).__init__()
+        
+        # 主分支
+        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
+        self.norm1 = nn.InstanceNorm2d(in_channels)
+        self.conv2 = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1)
+        self.norm2 = nn.InstanceNorm2d(out_channels)
+        
+        # 残差分支
+        self.shortcut = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+        )
+        
+    def forward(self, x):
+        residual = x
+        
+        # 主分支
+        out = F.relu(self.norm1(self.conv1(x)))
+        out = F.relu(self.norm2(self.conv2(out)))
+        
+        # 残差连接
+        out = out + self.shortcut(residual)
+        
+        return out
+
+
+# 自适应实例归一化残差块
+class AdaINResBlock(nn.Module):
+    def __init__(self, channels):
+        super(AdaINResBlock, self).__init__()
+        
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+        self.instance_norm1 = nn.InstanceNorm2d(channels, affine=False)
+        self.instance_norm2 = nn.InstanceNorm2d(channels, affine=False)
+        
+    def forward(self, x):
+        residual = x
+        
+        # 主分支
+        out = F.relu(self.instance_norm1(self.conv1(x)))
+        out = self.instance_norm2(self.conv2(out))
+        
+        # 残差连接
+        out = out + residual
+        out = F.relu(out)
+        
+        return out
+
+
+# 自注意力模块
+class SelfAttention(nn.Module):
+    def __init__(self, channels):
+        super(SelfAttention, self).__init__()
+        
+        self.query = nn.Conv2d(channels, channels//8, kernel_size=1)
+        self.key = nn.Conv2d(channels, channels//8, kernel_size=1)
+        self.value = nn.Conv2d(channels, channels, kernel_size=1)
+        
+        self.gamma = nn.Parameter(torch.zeros(1))
+        
+    def forward(self, x):
+        batch_size, C, height, width = x.size()
+        
+        # 线性映射
+        proj_query = self.query(x).view(batch_size, -1, height * width).permute(0, 2, 1)  # B x HW x C/8
+        proj_key = self.key(x).view(batch_size, -1, height * width)  # B x C/8 x HW
+        
+        # 注意力图
+        energy = torch.bmm(proj_query, proj_key)  # B x HW x HW
+        attention = F.softmax(energy, dim=2)
+        
+        # 加权值
+        proj_value = self.value(x).view(batch_size, -1, height * width)  # B x C x HW
+        out = torch.bmm(proj_value, attention.permute(0, 2, 1))  # B x C x HW
+        out = out.view(batch_size, C, height, width)
+        
+        # 残差连接
+        out = self.gamma * out + x
+        
+        return out
+
+
+# 计算风格特征的统计特性(均值和方差)
+def calc_style_statistics(features):
+    mean = features.mean(0, keepdim=True)
+    std = features.std(0, keepdim=True)
+    return {'mean': mean, 'std': std}
+
+
+# 计算两个风格特征的距离
+def style_distance(style_a, style_b):
+    mean_loss = F.mse_loss(style_a['mean'], style_b['mean'])
+    std_loss = F.mse_loss(style_a['std'], style_b['std'])
+    return mean_loss + std_loss
