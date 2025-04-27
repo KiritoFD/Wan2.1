@@ -197,7 +197,7 @@ class WanI2V:
         seed_g.manual_seed(seed)
         noise = torch.randn(
             16,
-            21,
+            (F - 1) // 4 + 1,
             lat_h,
             lat_w,
             dtype=torch.float32,
@@ -239,7 +239,7 @@ class WanI2V:
                 torch.nn.functional.interpolate(
                     img[None].cpu(), size=(h, w), mode='bicubic').transpose(
                         0, 1),
-                torch.zeros(3, 80, h, w)
+                torch.zeros(3, F - 1, h, w)
             ],
                          dim=1).to(self.device)
         ])[0]
