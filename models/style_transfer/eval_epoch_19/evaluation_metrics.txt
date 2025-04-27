@@ -1,0 +1,4 @@
+recon_loss_a: 0.1457
+transfer_fidelity: 0.0030
+cycle_consistency: 0.0000
+recon_loss_b: 0.0678
