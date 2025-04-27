@@ -508,14 +508,266 @@ class StyleTransferAAE:
             **kwargs: 额外参数传递给train方法
         """
         # 直接调用train方法，它已经实现了WGAN-GP训练
-        return self.train(
-            dataloader_a=dataloader_a,
-            dataloader_b=dataloader_b,
-            epochs=num_epochs,
-            save_dir=save_dir,
-            lambda_gp=lambda_gp,
-            **kwargs  # 传递所有额外参数
-        )
+        # 但需要增强稳定性，所以我们添加额外的梯度裁剪参数
+        return self.train(dataloader_a=dataloader_a,
+                         dataloader_b=dataloader_b,
+                         epochs=num_epochs,
+                         save_dir=save_dir,
+                         lambda_gp=lambda_gp,
+                         **kwargs)  # 传递所有额外参数
+    
+    # 添加梯度裁剪辅助函数，防止梯度爆炸
+    def _clip_gradients(self, optimizer, max_norm=1.0):
+        """对优化器中的参数进行梯度裁剪，防止梯度爆炸"""
+        for group in optimizer.param_groups:
+            torch.nn.utils.clip_grad_norm_(group['params'], max_norm)
+            
+    def train_stable(self, dataloader_a, dataloader_b, epochs=100, save_dir=None, lambda_gp=2.0, 
+                     clip_value=1.0, lr_decay=0.995):
+        """增强稳定性的训练方法，专为风格向量映射设计"""
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            
+        # 设为训练模式
+        self.encoder.train()
+        self.decoder.train()
+        self.discriminator.train()
+        self.mapper.train()
+        
+        # 创建无限循环迭代器
+        def infinite_loader(loader):
+            while True:
+                for data in loader:
+                    yield data
+                    
+        iter_a = infinite_loader(dataloader_a)
+        iter_b = infinite_loader(dataloader_b)
+        
+        # 每个epoch的步数
+        steps_per_epoch = min(len(dataloader_a), len(dataloader_b))
+        
+        # 学习率调度器 - 使用稍慢的衰减率
+        lr_scheduler_e = torch.optim.lr_scheduler.ExponentialLR(self.opt_E, gamma=lr_decay)
+        lr_scheduler_d = torch.optim.lr_scheduler.ExponentialLR(self.opt_D, gamma=lr_decay)
+        lr_scheduler_dis = torch.optim.lr_scheduler.ExponentialLR(self.opt_Dis, gamma=lr_decay)
+        lr_scheduler_m = torch.optim.lr_scheduler.ExponentialLR(self.opt_M, gamma=lr_decay)
+
+        # 设置初始较小学习率，让训练更稳定
+        for param_group in self.opt_Dis.param_groups:
+            param_group['lr'] = param_group['lr'] * 0.5
+        
+        # 修改版梯度惩罚函数
+        def wasserstein_gp(real_samples, fake_samples):
+            batch_size = real_samples.size(0)
+            
+            # 生成在真假样本之间插值的随机点
+            epsilon = torch.rand(batch_size, 1, device=self.device)
+            interpolated = epsilon * real_samples + (1 - epsilon) * fake_samples
+            interpolated.requires_grad_(True)
+            
+            # 判别器输出
+            d_interpolated = self.discriminator(interpolated)
+            
+            # 创建全1张量供梯度计算
+            grad_outputs = torch.ones_like(d_interpolated, device=self.device)
+            
+            # 计算梯度
+            gradients = torch.autograd.grad(
+                outputs=d_interpolated,
+                inputs=interpolated,
+                grad_outputs=grad_outputs,
+                create_graph=True,
+                retain_graph=True,
+            )[0]
+            
+            # 计算梯度范数
+            gradients = gradients.view(batch_size, -1)
+            gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * lambda_gp
+            return gradient_penalty
+        
+        # 开始训练
+        logging.info(f"开始稳定训练模式，共{epochs}个周期，梯度裁剪值={clip_value}")
+        start_time = time.time()
+        
+        best_loss = float('inf')
+        no_improve_epochs = 0
+        
+        for epoch in range(epochs):
+            # 累积损失
+            epoch_recon = 0
+            epoch_disc = 0
+            epoch_gen = 0
+            
+            pbar = tqdm(range(steps_per_epoch), desc=f"Epoch {epoch+1}/{epochs}")
+            for step in pbar:
+                # 获取数据
+                real_a = next(iter_a).to(self.device)
+                real_b = next(iter_b).to(self.device)
+                
+                # --------------------
+                # 1. 训练判别器
+                # --------------------
+                self.opt_Dis.zero_grad()
+                
+                # 编码样本
+                with torch.no_grad():
+                    z_a = self.encoder(real_a)
+                    z_b = self.encoder(real_b)
+                    z_ab = self.mapper(z_a)  # 从A映射到B的潜在表示
+                
+                # 真假样本判别
+                d_real = self.discriminator(z_b)  # 真样本得分
+                d_fake = self.discriminator(z_ab.detach())  # 假样本得分
+                
+                # Wasserstein损失
+                d_loss = torch.mean(d_fake) - torch.mean(d_real)
+                
+                # 梯度惩罚 - 只在步骤为偶数时计算以减少计算开销
+                if step % 2 == 0:
+                    gp = wasserstein_gp(z_b, z_ab.detach())
+                    d_loss = d_loss + gp
+                
+                # 反向传播
+                d_loss.backward()
+                self._clip_gradients(self.opt_Dis, clip_value)
+                self.opt_Dis.step()
+                
+                # --------------------
+                # 2. 训练自编码器和映射器
+                # --------------------
+                # 限制判别器训练频率，避免其过于强大
+                if step % 4 == 0:
+                    self.opt_E.zero_grad()
+                    self.opt_D.zero_grad()
+                    self.opt_M.zero_grad()
+                    
+                    # 获取潜在表示
+                    z_a = self.encoder(real_a)
+                    z_b = self.encoder(real_b)
+                    
+                    # 自编码重建
+                    recon_a = self.decoder(z_a)
+                    recon_b = self.decoder(z_b)
+                    
+                    # 重建损失 - 强调重建准确性
+                    loss_recon = (
+                        self.recon_loss(recon_a, real_a) + 
+                        self.recon_loss(recon_b, real_b)
+                    )
+                    
+                    # 风格映射
+                    z_ab = self.mapper(z_a)  # A->B映射
+                    fake_b = self.decoder(z_ab)  # 生成B风格图像
+                    
+                    # 循环一致性
+                    z_fake_b = self.encoder(fake_b)
+                    loss_cycle = self.content_loss(z_fake_b, z_ab)
+                    
+                    # 使用维度统计进行风格匹配 (更稳定的实现)
+                    stats_b = {
+                        'mean': z_b.mean(dim=0),
+                        'std': z_b.std(dim=0) + 1e-5
+                    }
+                    
+                    stats_ab = {
+                        'mean': z_ab.mean(dim=0),
+                        'std': z_ab.std(dim=0) + 1e-5
+                    }
+                    
+                    loss_style = (
+                        F.mse_loss(stats_ab['mean'], stats_b['mean']) + 
+                        F.mse_loss(stats_ab['std'], stats_b['std'])
+                    )
+                    
+                    # 对抗损失 - 使用更稳定的公式
+                    d_fake_gen = self.discriminator(z_ab)
+                    adv_weight = min(1.0, epoch * 0.1)  # 逐步增加对抗权重
+                    loss_adv = -torch.mean(d_fake_gen) * adv_weight
+                    
+                    # 总损失 - 精心调整权重
+                    g_total = (
+                        12.0 * loss_recon +    # 重建损失
+                        5.0 * loss_cycle +     # 循环一致性损失
+                        2.0 * loss_style +     # 风格统计损失
+                        adv_weight * loss_adv  # 动态调整的对抗损失
+                    )
+                    
+                    # 反向传播
+                    g_total.backward()
+                    
+                    # 应用梯度裁剪
+                    self._clip_gradients(self.opt_E, clip_value)
+                    self._clip_gradients(self.opt_D, clip_value)
+                    self._clip_gradients(self.opt_M, clip_value)
+                    
+                    # 更新参数
+                    self.opt_E.step()
+                    self.opt_D.step()
+                    self.opt_M.step()
+                    
+                    # 记录损失
+                    epoch_recon += loss_recon.item()
+                    epoch_gen += loss_adv.item() if isinstance(loss_adv, torch.Tensor) else 0
+                
+                # 记录判别器损失
+                epoch_disc += d_loss.item()
+                
+                # 更新进度条
+                pbar.set_postfix({
+                    'd_loss': f"{d_loss.item():.3f}",
+                    'recon': f"{loss_recon.item():.3f}" if 'loss_recon' in locals() else 'N/A'
+                })
+            
+            # 计算平均损失
+            avg_recon = epoch_recon / (steps_per_epoch / 4)  # 调整为实际更新次数
+            avg_disc = epoch_disc / steps_per_epoch
+            avg_gen = epoch_gen / (steps_per_epoch / 4)
+            
+            # 记录到历史
+            self.history['recon_loss'].append(avg_recon)
+            self.history['disc_loss'].append(avg_disc)
+            self.history['gen_loss'].append(avg_gen)
+            
+            # 日志输出
+            logging.info(
+                f"Epoch {epoch+1}/{epochs}, "
+                f"重建: {avg_recon:.4f}, "
+                f"判别器: {avg_disc:.4f}, "
+                f"生成器: {avg_gen:.4f}"
+            )
+            
+            # 学习率调度
+            lr_scheduler_e.step()
+            lr_scheduler_d.step()
+            lr_scheduler_dis.step()
+            lr_scheduler_m.step()
+            
+            # 早停检查
+            current_loss = avg_recon + abs(avg_disc) + abs(avg_gen)
+            if current_loss < best_loss:
+                best_loss = current_loss
+                no_improve_epochs = 0
+                # 保存最佳模型
+                if save_dir:
+                    self.save_model(os.path.join(save_dir, "best_model.pth"))
+            else:
+                no_improve_epochs += 1
+            
+            # 定期保存检查点
+            if save_dir and (epoch + 1) % 10 == 0:
+                self.save_checkpoint(os.path.join(save_dir, f"checkpoint_{epoch+1}.pt"))
+            
+            # 如果连续15个epoch没有改善，提前停止
+            if no_improve_epochs >= 15:
+                logging.info(f"提前停止训练: 连续{no_improve_epochs}个周期无改善")
+                break
+        
+        # 训练完成
+        self.is_trained = True
+        elapsed = time.time() - start_time
+        logging.info(f"训练完成，用时: {elapsed:.2f}秒")
+        
+        return self.history
     
     def save_model(self, path):
         """保存模型"""

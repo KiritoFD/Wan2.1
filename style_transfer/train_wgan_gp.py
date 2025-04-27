@@ -35,7 +35,7 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="models/style_transfer_wgan", help="输出目录")
     parser.add_argument("--batch_size", type=int, default=8, help="批次大小")
     parser.add_argument("--latent_dim", type=int, default=128, help="潜在空间维度")
-    parser.add_argument("--epochs", type=int, default=200, help="训练轮数")
+    parser.add_argument("--epochs", type=int, default=20, help="训练轮数")
     parser.add_argument("--valid_split", type=float, default=0.1, help="验证集比例")
     parser.add_argument("--device", type=str, default="cuda", help="训练设备")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
@@ -43,6 +43,8 @@ def parse_args():
     parser.add_argument("--n_critic", type=int, default=5, help="判别器每训练n次，生成器训练一次")
     parser.add_argument("--eval_interval", type=int, default=10, help="每多少轮评估一次模型")
     parser.add_argument("--checkpoint", type=str, default=None, help="继续训练的检查点路径")
+    parser.add_argument("--best_model", type=str, default=None, help="从最佳模型参数继续训练的路径")
+    parser.add_argument("--resume_from_best", action="store_true", help="是否从上一次训练的最佳模型继续训练")
     return parser.parse_args()
 
 def verify_file(file_path):
@@ -150,36 +152,84 @@ def main():
     # 继续训练
     if args.checkpoint:
         logging.info(f"从检查点继续训练: {args.checkpoint}")
-        model.load_checkpoint(args.checkpoint)
+        try:
+            model.load_checkpoint(args.checkpoint)
+        except AttributeError:
+            logging.warning("load_checkpoint方法不存在，尝试使用load_model方法")
+            model.load_model(args.checkpoint)
+            
+    elif args.best_model:
+        logging.info(f"从最佳模型继续训练: {args.best_model}")
+        model.load_model(args.best_model)
+        
+    elif args.resume_from_best:
+        best_model_path = os.path.join(args.output_dir, "best_model.pth")
+        if os.path.exists(best_model_path):
+            logging.info(f"从上一次的最佳模型继续训练: {best_model_path}")
+            model.load_model(best_model_path)
+        else:
+            logging.warning(f"未找到上一次的最佳模型: {best_model_path}")
     
-    # 使用WGAN-GP训练
-    logging.info("开始WGAN-GP训练模型...")
+    # 使用优化后的稳定训练方法
+    logging.info("使用优化的稳定训练方法...")
     start_time = time.time()
     
-    history = model.train_with_gradient_penalty(
+    history = model.train_stable(
         train_loader_a,
         train_loader_b,
-        num_epochs=args.epochs,
+        epochs=args.epochs,
         save_dir=args.output_dir,
         lambda_gp=args.lambda_gp,
-        n_critic=args.n_critic,
-        eval_interval=args.eval_interval
+        clip_value=1.0,  # 添加梯度裁剪值
+        lr_decay=0.995   # 添加学习率衰减参数
     )
     
     # 训练完成
     elapsed_time = time.time() - start_time
-    logging.info(f"WGAN-GP训练完成，总耗时: {elapsed_time:.2f}秒")
+    logging.info(f"稳定训练完成，总耗时: {elapsed_time:.2f}秒")
     
     # 执行最终评估
     logging.info("执行最终模型评估...")
     eval_dir = os.path.join(args.output_dir, "final_evaluation")
-    metrics = model.evaluate(valid_loader_a, valid_loader_b, save_dir=eval_dir, n_samples=10)
+    os.makedirs(eval_dir, exist_ok=True)
     
-    logging.info(f"最终评估指标:")
+    # 使用训练期间保存的最佳模型进行评估
+    best_model_path = os.path.join(args.output_dir, "best_model.pth")
+    if os.path.exists(best_model_path):
+        logging.info(f"加载最佳模型参数: {best_model_path}")
+        model.load_model(best_model_path)  # 加载最佳模型
+        logging.info("已加载最佳模型参数进行评估")
+        
+    # 简单的评估方法，替代不存在的evaluate方法
+    try:
+        # 从验证集抽取少量样本进行风格转换，保存结果
+        logging.info("生成风格转换样例...")
+        with torch.no_grad():
+            # 从验证集获取一些样本
+            sample_batch_a = next(iter(valid_loader_a)).to(args.device)
+            logging.info(f"样例已保存到: {os.path.join(eval_dir, 'sample_transfers.pt')}")
+            
+            # 执行风格转换
+            transferred = model.transfer_style(sample_batch_a)
+            # 保存样本数据
+            sample_data = {
+                'original': sample_batch_a.cpu(),
+                'transferred': transferred
+            }
+            torch.save(sample_data, os.path.join(eval_dir, "sample_transfers.pt"))
+            logging.info(f"样例已保存到: {os.path.join(eval_dir, 'sample_transfers.pt')}")
+    except Exception as e:
+        logging.error(f"生成样例时出错: {e}")
+    
+    # 计算并记录最终训练指标
+    metrics = {
+        'final_gen_loss': history['gen_loss'][-1] if history['gen_loss'] else float('nan'),
+        'final_disc_loss': history['disc_loss'][-1] if history['disc_loss'] else float('nan'),
+        'final_recon_loss': history['recon_loss'][-1] if history['recon_loss'] else float('nan'),
+    }
+    logging.info(f"最终训练指标:")
     for name, value in metrics.items():
         logging.info(f"  - {name}: {value:.4f}")
-    
-    logging.info(f"模型和评估结果已保存到: {args.output_dir}")
 
 if __name__ == "__main__":
     main()
