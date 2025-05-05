@@ -760,7 +760,7 @@ class StyleTransferAAE:
                 self.save_checkpoint(os.path.join(save_dir, f"checkpoint_{epoch+1}.pt"), current_epoch=epoch)
             
             # 如果连续15个epoch没有改善，提前停止
-            if no_improve_epochs >= 15:
+            if no_improve_epochs >= 150:
                 logging.info(f"提前停止训练: 连续{no_improve_epochs}个周期无改善")
                 break
         

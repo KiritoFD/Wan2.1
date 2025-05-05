@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .tokenizer_utils import HuggingfaceTokenizer
+from .tokenizers import HuggingfaceTokenizer
 
 __all__ = [
     'T5Model',
@@ -446,7 +446,7 @@ def _t5(name,
 
     # init tokenizer
     if return_tokenizer:
-        from .tokenizer_utils import HuggingfaceTokenizer
+        from .tokenizers import HuggingfaceTokenizer
         tokenizer = HuggingfaceTokenizer(f'google/{name}', **tokenizer_kwargs)
         return model, tokenizer
     else:

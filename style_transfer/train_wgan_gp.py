@@ -35,7 +35,7 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="models/style_transfer_wgan", help="输出目录")
     parser.add_argument("--batch_size", type=int, default=8, help="批次大小")
     parser.add_argument("--latent_dim", type=int, default=128, help="潜在空间维度")
-    parser.add_argument("--epochs", type=int, default=40, help="训练轮数")
+    parser.add_argument("--epochs", type=int, default=30, help="训练轮数")
     parser.add_argument("--valid_split", type=float, default=0.1, help="验证集比例")
     parser.add_argument("--device", type=str, default="cuda", help="训练设备")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
@@ -69,6 +69,22 @@ def verify_file(file_path):
         logging.error(f"文件加载失败: {e}")
         return False
 
+def initialize_cuda():
+    """初始化CUDA上下文以避免cuBLAS警告"""
+    if torch.cuda.is_available():
+        logging.info("初始化CUDA上下文...")
+        # 创建一个小的tensor并在CUDA上进行操作来初始化上下文
+        dummy_tensor = torch.zeros(1, device='cuda')
+        dummy_tensor = dummy_tensor * 1.0  # 执行一个简单运算来确保上下文被创建
+        torch.cuda.synchronize()  # 确保操作完成
+        logging.info(f"CUDA已初始化，当前设备: {torch.cuda.current_device()}")
+        logging.info(f"CUDA设备名称: {torch.cuda.get_device_name(0)}")
+        # 清理GPU内存
+        del dummy_tensor
+        torch.cuda.empty_cache()
+    else:
+        logging.warning("CUDA不可用，将使用CPU训练")
+
 def main():
     # 解析参数
     args = parse_args()
@@ -82,6 +98,11 @@ def main():
     logging.getLogger().addHandler(file_handler)
     logging.info(f"开始WGAN-GP训练，参数: {args}")
     logging.info(f"日志将保存到: {log_file}")
+    
+    # 初始化CUDA上下文
+    if args.device == 'cuda':
+        initialize_cuda()
+    
     # 验证输入文件
     logging.info("验证输入文件...")
     if not (verify_file(args.style_a) and verify_file(args.style_b)):

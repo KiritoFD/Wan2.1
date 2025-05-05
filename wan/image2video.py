@@ -101,20 +101,6 @@ class WanI2V:
 
         if t5_fsdp or dit_fsdp or use_usp:
             init_on_cpu = False
-        
-        # 加载风格转换模型（如果配置中指定了）
-        self.style_transfer_model = None
-        if hasattr(config, 'style_transfer') and config.style_transfer.enabled:
-            try:
-                from ..style_transfer.style_manager import StyleManager
-                self.style_transfer_model = StyleManager(
-                    model_path=os.path.join(checkpoint_dir, config.style_transfer.model_path),
-                    device=self.device
-                )
-                logging.info(f"Loaded style transfer model from {config.style_transfer.model_path}")
-            except Exception as e:
-                logging.error(f"Failed to load style transfer model: {e}")
-                self.style_transfer_model = None
 
         if use_usp:
             from xfuser.core.distributed import \
@@ -133,8 +119,7 @@ class WanI2V:
         if dist.is_initialized():
             dist.barrier()
         if dit_fsdp:
-            for k in self.model.blocks:
-                self.model = shard_fn(self.model)
+            self.model = shard_fn(self.model)
         else:
             if not init_on_cpu:
                 self.model.to(self.device)
@@ -258,12 +243,6 @@ class WanI2V:
             ],
                          dim=1).to(self.device)
         ])[0]
-        
-        # 应用风格转换（如果启用）
-        if hasattr(self, 'style_transfer_model') and self.style_transfer_model is not None:
-            logging.info("Applying style transfer to VAE encoded features")
-            y = self.style_transfer_model.transfer_features(y)
-            
         y = torch.concat([msk, y])
 
         @contextmanager

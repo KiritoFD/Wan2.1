@@ -100,7 +100,7 @@ def gradio_interface():
                             label="Diffusion steps",
                             minimum=1,
                             maximum=1000,
-                            value=50,
+                            value=30,
                             step=1)
                         guide_scale = gr.Slider(
                             label="Guide scale",

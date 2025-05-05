@@ -117,7 +117,8 @@ class WanT2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 clip_fea=None):  # 添加clip_fea参数
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -142,6 +143,8 @@ class WanT2V:
                 Random seed for noise generation. If -1, use random seed.
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
+            clip_fea (`torch.Tensor`, *optional*, defaults to None):
+                CLIP image features for image conditioning
 
         Returns:
             torch.Tensor:
@@ -223,8 +226,14 @@ class WanT2V:
             # sample videos
             latents = noise
 
+            # 更新参数字典，包括CLIP特征
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
+            
+            # 如果提供了CLIP特征，添加到参数中
+            if clip_fea is not None:
+                arg_c['clip_fea'] = clip_fea
+                arg_null['clip_fea'] = clip_fea  # 对无条件分支也使用相同的图像特征
 
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
