@@ -1,6 +1,6 @@
 .*
 *.py[cod]
-*.jpg
+.jpg
 *.jpeg
 *.png
 *.gif
