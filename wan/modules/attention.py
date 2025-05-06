@@ -108,9 +108,10 @@ def flash_attention(
             softmax_scale=softmax_scale,
             causal=causal,
             deterministic=deterministic)[0].unflatten(0, (b, lq))
-    else:
-        assert FLASH_ATTN_2_AVAILABLE
-        x = flash_attn.flash_attn_varlen_func(
+    elif FLASH_ATTN_2_AVAILABLE:
+        # 确保只在 flash_attn 模块可用时使用它
+        from flash_attn import flash_attn_varlen_func
+        x = flash_attn_varlen_func(
             q=q,
             k=k,
             v=v,
@@ -125,6 +126,26 @@ def flash_attention(
             causal=causal,
             window_size=window_size,
             deterministic=deterministic).unflatten(0, (b, lq))
+    else:
+        # 如果两种flash attention都不可用，回退到普通注意力
+        warnings.warn(
+            '既没有Flash Attention 2也没有Flash Attention 3可用，回退到使用普通注意力机制'
+        )
+        # 恢复原始形状并转置为注意力计算所需格式
+        q_reshaped = q.unflatten(0, (b, lq)).transpose(1, 2)
+        k_reshaped = k.unflatten(0, (b, lk)).transpose(1, 2)
+        v_reshaped = v.unflatten(0, (b, lk)).transpose(1, 2)
+        
+        # 计算普通注意力
+        attn_mask = None
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q_reshaped, k_reshaped, v_reshaped, 
+            attn_mask=attn_mask, 
+            is_causal=causal, 
+            dropout_p=dropout_p)
+        
+        # 转回原始格式
+        x = out.transpose(1, 2)
 
     # output
     return x.type(out_dtype)
@@ -146,21 +167,25 @@ def attention(
     fa_version=None,
 ):
     if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
-        return flash_attention(
-            q=q,
-            k=k,
-            v=v,
-            q_lens=q_lens,
-            k_lens=k_lens,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            q_scale=q_scale,
-            causal=causal,
-            window_size=window_size,
-            deterministic=deterministic,
-            dtype=dtype,
-            version=fa_version,
-        )
+        try:
+            return flash_attention(
+                q=q,
+                k=k,
+                v=v,
+                q_lens=q_lens,
+                k_lens=k_lens,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                q_scale=q_scale,
+                causal=causal,
+                window_size=window_size,
+                deterministic=deterministic,
+                dtype=dtype,
+                version=fa_version,
+            )
+        except Exception as e:
+            warnings.warn(f"Flash Attention失败: {e}，回退到使用scaled_dot_product_attention")
+            # 异常捕获范围扩大到所有Exception，确保在任何错误情况下都能回退
     else:
         if q_lens is not None or k_lens is not None:
             warnings.warn(
