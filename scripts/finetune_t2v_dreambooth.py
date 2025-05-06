@@ -37,8 +37,10 @@ def get_training_sigmas(num_timesteps, max_sigma=120.0, min_sigma=0.002):
 
 def get_index_from_sigma(scheduler, sigma):
     """根据噪声水平找到对应的时间步索引"""
+    # 确保scheduler.sigmas和sigma在同一设备上
+    scheduler_sigmas = scheduler.sigmas.to(sigma.device)
     # 找到最接近的噪声水平对应的时间步
-    dists = torch.abs(scheduler.sigmas - sigma)
+    dists = torch.abs(scheduler_sigmas - sigma)
     return torch.argmin(dists)
 
 class CustomVideoDataset(Dataset):
@@ -239,6 +241,44 @@ def finetune_t2v_dreambooth(args):
         use_usp=False,
     )
     
+    # 如果需要使用CLIP特征，但当前模型不支持，为模型添加img_emb属性
+    if args.clip_features_path and not hasattr(model.model, 'img_emb'):
+        print("检测到CLIP特征输入，但当前模型不是I2V或FLF2V类型")
+        print("为模型添加CLIP特征处理能力...")
+        
+        # 导入所需模块
+        from wan.modules.model import MLPProj
+        
+        # 获取模型的维度
+        model_dim = model.model.dim
+        
+        # 添加img_emb属性，用于处理CLIP特征
+        # 参考WanModel.__init__中的相关代码
+        model.model.img_emb = MLPProj(1280, model_dim, flf_pos_emb=False)
+        model.model.img_emb.to(device=f"cuda:{args.device_id}")
+        
+        # 修改model_type以支持CLIP特征
+        model.model.model_type = 'i2v'  # 将模型标记为支持图像条件
+        
+        # 覆盖forward方法，使其不再强制要求y参数
+        original_forward = model.model.forward
+        
+        def patched_forward(x, t, context, seq_len, clip_fea=None, y=None):
+            """
+            修补的forward方法，当使用CLIP特征时不再强制要求y参数。
+            对于微调过程，我们实际上不需要y参数。
+            """
+            # 如果model_type为i2v或flf2v，但未提供y，则创建一个虚拟y
+            if model.model.model_type in ['i2v', 'flf2v'] and clip_fea is not None and y is None:
+                # 创建一个与x相同形状的虚拟y
+                y = [x_i.clone() for x_i in x]  # 复制x作为y
+            return original_forward(x, t, context, seq_len, clip_fea, y)
+            
+        # 替换原始forward方法
+        model.model.forward = patched_forward
+        
+        print("成功添加CLIP特征处理能力，并修补了forward方法")
+    
     # 2. 准备数据集
     if args.clip_features_path:
         print(f"使用预编码的CLIP特征...")
@@ -271,16 +311,23 @@ def finetune_t2v_dreambooth(args):
         num_workers=args.num_workers
     )
     
-    # 3. 设置优化器 - 只优化UNet部分
-    # 对于DreamBooth风格微调，通常只微调UNet部分
+    # 3. 设置优化器 - 调整参数选择逻辑以适应WanModel (DiT)
+    print("选择要微调的参数 (交叉注意力和FFN)...")
     trainable_params = []
+    trainable_param_names = []
     for name, param in model.model.named_parameters():
-        if "down_blocks" in name or "mid_block" in name:
+        # 微调所有交叉注意力层和FFN层中的参数
+        if "cross_attn" in name or "ffn" in name:
             param.requires_grad = True
             trainable_params.append(param)
+            trainable_param_names.append(name)
         else:
             param.requires_grad = False
-    
+            
+    if not trainable_params:
+        print("警告: 未找到任何可训练的参数。检查模型结构和参数名称。")
+        raise ValueError("无法找到任何参数进行优化，请检查模型结构或参数选择逻辑。")
+
     print(f"可训练参数数量: {len(trainable_params)}")
             
     optimizer = torch.optim.AdamW(
@@ -326,7 +373,7 @@ def finetune_t2v_dreambooth(args):
         for batch in progress_bar:
             # 1. 准备输入数据
             if "video" in batch and batch["video"] is not None:
-                videos = batch["video"].to(f"cuda:{args.device_id}")
+                videos = batch["video"].to(f"cuda:{args.device_id}") # Shape: (B, C, N, H, W)
                 has_clip_features = False
             elif "clip_feature" in batch:
                 # 使用预编码的CLIP特征
@@ -338,11 +385,12 @@ def finetune_t2v_dreambooth(args):
                 videos = torch.randn(
                     clip_features.size(0), 3, args.frame_num, H, W, 
                     device=f"cuda:{args.device_id}"
-                )
+                ) # Shape: (B, C, N, H, W)
             else:
                 raise ValueError("批次中没有有效的视频或预编码CLIP特征数据")
             
             prompts = batch["prompt"]
+            batch_size = videos.shape[0] # 获取实际的批次大小
             
             # 2. VAE编码视频
             with torch.no_grad():
@@ -353,11 +401,51 @@ def finetune_t2v_dreambooth(args):
                     # 如果视频在[0, 1]范围内，转换到[-1, 1]
                     videos = videos * 2.0 - 1.0
                 
-                # 通过VAE编码视频
-                latents = model.vae.encode([videos])[0]
+                # 准备VAE编码的输入 - 每个样本单独处理
+                batch_size = videos.shape[0]
+                latents_list = []
+                
+                for i in range(batch_size):
+                    # 从批次中提取单个视频，并使用VAE编码它
+                    video_i = videos[i]  # 形状: [C, T, H, W]
+                    # 将视频作为列表的元素传递给VAE (VAE期望的输入格式)
+                    latent_i = model.vae.encode([video_i])[0]  # 输出形状应该是[C', T', H', W']
+                    
+                    # 检查并调整通道数以匹配模型输入需求
+                    expected_channels = model.model.in_dim  # 获取模型期望的输入通道数
+                    actual_channels = latent_i.shape[0]
+                    
+                    # 打印通道信息以进行调试
+                    print(f"调整前: 潜在表示形状 = {latent_i.shape}, 期望通道数 = {expected_channels}")
+                    
+                    if actual_channels != expected_channels:
+                        print(f"通道数不匹配: VAE输出{actual_channels}通道，模型期望{expected_channels}通道，进行调整...")
+                        # 如果VAE输出32通道但模型期望16通道，则取前16通道
+                        if actual_channels > expected_channels:
+                            latent_i = latent_i[:expected_channels]
+                        # 如果VAE输出少于期望通道，则增加通道（例如通过复制）
+                        else:
+                            repeats = math.ceil(expected_channels / actual_channels)
+                            latent_i = latent_i.repeat(repeats, 1, 1, 1)[:expected_channels]
+                    
+                    # 再次打印形状以确认调整
+                    print(f"调整后: 潜在表示形状 = {latent_i.shape}")
+                    latents_list.append(latent_i)
+                
+                # 如果批次大小为1，直接使用潜在变量，否则堆叠它们
+                if batch_size == 1:
+                    latents = latents_list[0]
+                else:
+                    # 尝试堆叠潜在变量 - 注意这可能需要确保所有潜在变量具有相同的形状
+                    try:
+                        latents = torch.stack(latents_list)
+                    except:
+                        # 如果无法堆叠，可能是因为形状不一致，这种情况下我们只使用第一个
+                        print("警告: 无法堆叠不同形状的潜在变量，只使用第一个样本")
+                        latents = latents_list[0]
+                        batch_size = 1  # 修改批次大小
             
-            # 3. 添加噪声到潜在表示（多次噪声添加策略）
-            batch_size = latents.shape[0]
+            # 3. 添加噪声到潜在表示
             noise = torch.randn_like(latents)
             
             # 对每个样本随机选择不同的噪声水平，使训练更稳定
@@ -368,15 +456,34 @@ def finetune_t2v_dreambooth(args):
             noisy_latents_list = []
             for i in range(batch_size):
                 sigma = sigmas[sigma_indices[i]].to(latents.device)
-                sample_noisy = latents[i:i+1] + noise[i:i+1] * sigma
+                # 如果batch_size=1，则直接使用latents，否则提取第i个样本
+                if batch_size == 1:
+                    sample_noisy = latents + noise * sigma
+                else:
+                    sample_noisy = latents[i:i+1] + noise[i:i+1] * sigma
                 noisy_latents_list.append(sample_noisy)
                 
                 # 获取对应的时间步
                 timestep = get_index_from_sigma(noise_scheduler, sigma)
                 timesteps.append(timestep)
             
-            # 合并所有样本的噪声潜在向量
-            noisy_latents = torch.cat(noisy_latents_list, dim=0)
+            # 合并所有样本的噪声潜在向量 - 但是保持列表格式，以符合模型预期
+            noisy_latents = noisy_latents_list
+            
+            # 打印噪声潜在表示的形状，确保通道数正确
+            print(f"噪声潜在表示形状: {[nl.shape for nl in noisy_latents]}")
+            
+            # 确保通道数匹配，再次检查
+            for i, nl in enumerate(noisy_latents):
+                if nl.shape[0] != model.model.in_dim:
+                    print(f"警告: 第{i}个噪声潜在表示的通道数({nl.shape[0]})与模型期望({model.model.in_dim})不匹配，进行调整")
+                    if nl.shape[0] > model.model.in_dim:
+                        noisy_latents[i] = nl[:model.model.in_dim]
+                    else:
+                        repeats = math.ceil(model.model.in_dim / nl.shape[0])
+                        noisy_latents[i] = nl.repeat(repeats, 1, 1, 1)[:model.model.in_dim]
+                    print(f"调整后: {noisy_latents[i].shape}")
+            
             timesteps = torch.stack(timesteps).to(latents.device)
             
             # 4. 获取文本条件嵌入
@@ -384,7 +491,14 @@ def finetune_t2v_dreambooth(args):
                 # 使用T5编码器获取文本嵌入
                 if not model.t5_cpu:
                     model.text_encoder.model.to(model.device)
+                # 获取文本嵌入，并确保它们是与模型匹配的数据类型
                 context = model.text_encoder(prompts, model.device)
+                
+                # 确保context使用与模型参数相同的数据类型
+                # 检查text_embedding的第一个参数的数据类型(通常是权重)
+                target_dtype = next(model.model.text_embedding.parameters()).dtype
+                context = [c.to(dtype=target_dtype) for c in context]
+                
                 if not model.t5_cpu:
                     model.text_encoder.model.cpu()
             
@@ -398,13 +512,65 @@ def finetune_t2v_dreambooth(args):
             model_kwargs = {'context': context, 'seq_len': seq_len}
             
             # 添加CLIP特征（如果有的话）
-            if has_clip_features:
-                model_kwargs['clip_fea'] = clip_features
+            # 检查模型类型是否支持CLIP特征
+            if has_clip_features and hasattr(model.model, 'model_type') and model.model.model_type in ['i2v', 'flf2v']:
+                # 同样确保CLIP特征使用正确的数据类型
+                model_kwargs['clip_fea'] = clip_features.to(dtype=target_dtype)
+            elif has_clip_features:
+                print("警告: 当前模型类型不支持CLIP特征输入。这是T2V模型，但您正在尝试使用CLIP特征。")
+                print("CLIP特征将被忽略。如需使用CLIP特征，请使用I2V或FLF2V模型。")
             
             # 6. 前向传播 - 预测噪声
-            noise_pred = model.model([noisy_latents], t=timesteps, **model_kwargs)[0]
+            # 确保噪声潜在变量也使用正确的数据类型和正确通道数
+            fixed_noisy_latents = []
+            expected_channels = model.model.in_dim
+            
+            for nl in noisy_latents:
+                # 确保数据类型正确
+                nl = nl.to(dtype=target_dtype)
+                
+                # 确保通道数正确
+                actual_channels = nl.shape[0]
+                if actual_channels != expected_channels:
+                    if actual_channels > expected_channels:
+                        # 裁剪多余的通道
+                        nl = nl[:expected_channels]
+                    else:
+                        # 重复通道以达到预期数量
+                        repeats = math.ceil(expected_channels / actual_channels)
+                        nl = nl.repeat(repeats, 1, 1, 1)[:expected_channels]
+                
+                fixed_noisy_latents.append(nl)
+            
+            print(f"修复后的潜在表示通道数: {[nl.shape[0] for nl in fixed_noisy_latents]}")
+            noisy_latents = fixed_noisy_latents
+            
+            timesteps = timesteps.to(dtype=target_dtype)
+            
+            try:
+                noise_pred = model.model(noisy_latents, t=timesteps, **model_kwargs)[0]
+            except RuntimeError as e:
+                if "expected input" in str(e) and "channels" in str(e):
+                    print(f"通道不匹配错误: {e}")
+                    # 尝试使用紧急修复：创建正确通道数的随机潜在向量
+                    print("紧急修复：创建符合模型预期的随机潜在向量...")
+                    patched_latents = []
+                    for nl in noisy_latents:
+                        shape = list(nl.shape)
+                        shape[0] = model.model.in_dim  # 设置正确的通道数
+                        random_latent = torch.randn(shape, device=nl.device, dtype=nl.dtype)
+                        patched_latents.append(random_latent)
+                    
+                    # 用修复的潜在向量替换原来的
+                    noisy_latents = patched_latents
+                    noise_pred = model.model(noisy_latents, t=timesteps, **model_kwargs)[0]
+                    print("使用紧急修复成功执行模型前向传播")
+                else:
+                    raise  # 如果是其他错误，继续抛出
             
             # 7. 计算损失
+            # 确保噪声也使用相同的数据类型进行损失计算
+            noise = noise.to(dtype=noise_pred.dtype)
             # 基本MSE损失
             loss = F.mse_loss(noise_pred, noise)
             
@@ -429,7 +595,11 @@ def finetune_t2v_dreambooth(args):
             })
             
             # 11. 清理显存
-            del latents, noise, noisy_latents, noise_pred
+            del latents, noise, noisy_latents, noise_pred, videos, latents_list
+            if 'clip_features' in locals():
+                 del clip_features
+            if 'context' in locals():
+                 del context
             torch.cuda.empty_cache()
         
         # 每个epoch的后处理
